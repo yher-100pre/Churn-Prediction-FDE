@@ -1,0 +1,22 @@
+# Generated model artifacts — stored in S3, not git
+models/
+*.json.model
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+*.egg-info/
+
+# Data outputs
+data/synthetic_events.json
+data/training_features.parquet
+data/training_features.csv
+data/rfm_features.parquet
+data/rfm_features.csv
+
+# AWS
+.terraform/
+*.tfstate
+*.tfstate.backup

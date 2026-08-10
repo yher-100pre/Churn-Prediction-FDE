@@ -160,3 +160,109 @@ LR_RECENCY_CAP = 365.0
 # --- Explainability ----------------------------------------------------------
 # All nine features fit on one SHAP summary plot, so nothing is truncated.
 SHAP_MAX_DISPLAY = 9
+
+
+def load_and_split(
+    features_path: str | Path,
+    test_size: float = TEST_SIZE,
+    seed: int = RANDOM_SEED,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load the feature table, hold out real customers, and split the synthetic set.
+
+    Returns (X_train, X_test, y_train, y_test, X_lr_train, X_lr_test, df_ood).
+
+    Two feature matrices come back because the two model families disagree about
+    what NO_SESSION_RECENCY means. X carries the raw 999.0 sentinel for XGBoost,
+    which splits it off as its own regime. X_lr caps recency at LR_RECENCY_CAP and
+    adds an explicit indicator, because a linear model would otherwise read the
+    sentinel as a 999-day distance and let it dominate the coefficient -- see the
+    LR_NO_SESSION_COL comment above. Both matrices are sliced with the SAME split
+    indices, so row i of X_train and row i of X_lr_train are the same customer.
+
+    Real (non-synthetic) customers never enter the split. They come back untouched
+    in df_ood as an out-of-distribution sanity check, so the model is never fitted
+    or thresholded on the 80 raw customers it will later be sanity-checked against.
+    """
+    features_path = Path(features_path)
+    if not features_path.exists():
+        # Deliberately fatal rather than regenerating: training that silently
+        # rebuilds its own input can fit a different dataset than the one the
+        # reported metrics claim, and nothing downstream would reveal it.
+        raise FileNotFoundError(
+            f"Feature table not found: {features_path}\n"
+            f"Generate it first:  python src/generate_synthetic.py --n-customers 5000\n"
+            f"(training never regenerates its own input -- see load_and_split)"
+        )
+
+    df = pd.read_parquet(features_path)
+    print(f"Loaded {len(df)} customers from {features_path}")
+
+    missing = [c for c in FEATURE_COLS + [TARGET_COL] if c not in df.columns]
+    if missing:
+        raise ValueError(f"Feature table is missing required columns: {missing}")
+
+    # --- Separate synthetic from real ----------------------------------------
+    # .eq(True) rather than a truth test: it is null-safe, so a missing or NaN
+    # flag falls to the real side. Real is the conservative default -- a row of
+    # unknown provenance must not silently join the training set.
+    if "is_synthetic" in df.columns:
+        is_synthetic = df["is_synthetic"].eq(True)
+    else:
+        is_synthetic = pd.Series(False, index=df.index)
+
+    df_synthetic = df[is_synthetic]
+    df_ood = df[~is_synthetic]
+    print(f"  synthetic (train/test): {len(df_synthetic)}")
+    print(f"  real (held out as OOD): {len(df_ood)}")
+
+    if df_synthetic.empty:
+        raise ValueError(
+            f"No synthetic customers in {features_path} -- nothing to train on.\n"
+            f"Expected an is_synthetic=True flag, which build_features merges from "
+            f"the customer sidecar. Was this table built without one?"
+        )
+
+    # --- Feature matrices (synthetic only) -----------------------------------
+    # FEATURE_COLS order is contractual and published in feature_spec.json.
+    X = df_synthetic[FEATURE_COLS].astype(float)
+    y = df_synthetic[TARGET_COL].astype(int)
+
+    if y.nunique() < 2:
+        raise ValueError(f"Training labels are all one class ({y.iloc[0]}) -- cannot fit a classifier.")
+
+    # Exact equality is safe here: build_features assigns NO_SESSION_RECENCY as a
+    # literal for customers with no pre-cutoff session, never as a computed value,
+    # so there is no floating-point drift to tolerate.
+    X_lr = X.copy()
+    X_lr[LR_NO_SESSION_COL] = (X_lr["recency_days"] == NO_SESSION_RECENCY).astype(float)
+    X_lr["recency_days"] = X_lr["recency_days"].clip(upper=LR_RECENCY_CAP)
+
+    n_sentinel = int(X_lr[LR_NO_SESSION_COL].sum())
+    print(f"  no prior session (recency == {NO_SESSION_RECENCY:.0f}): {n_sentinel} "
+          f"({n_sentinel / len(X_lr):.1%}) -- raw for XGBoost, split into "
+          f"{LR_NO_SESSION_COL} + cap {LR_RECENCY_CAP:.0f} for LR")
+
+    # --- Stratified split ----------------------------------------------------
+    # Split the INDEX once and slice both matrices with it, rather than calling
+    # train_test_split twice and trusting two calls to agree. They would agree
+    # today; they would stop agreeing the moment either call's arguments drifted,
+    # and the resulting row misalignment between X and X_lr would be invisible.
+    train_idx, test_idx = train_test_split(
+        df_synthetic.index, test_size=test_size, random_state=seed, stratify=y
+    )
+
+    X_train, X_test = X.loc[train_idx], X.loc[test_idx]
+    y_train, y_test = y.loc[train_idx], y.loc[test_idx]
+    X_lr_train, X_lr_test = X_lr.loc[train_idx], X_lr.loc[test_idx]
+
+    # --- Class balance -------------------------------------------------------
+    # Printed with the majority-class rate alongside, because that rate is the
+    # accuracy floor every headline number has to be read against (see docstring).
+    print(f"\nSplit: {len(X_train)} train / {len(X_test)} test (test_size={test_size}, seed={seed})")
+    for name, split in (("train", y_train), ("test", y_test)):
+        churn_rate = split.mean()
+        print(f"  {name:<5} n={len(split):<5} churned={int(split.sum()):<5} "
+              f"({churn_rate:.3f})  retained={int((1 - split).sum()):<5} ({1 - churn_rate:.3f})  "
+              f"accuracy floor={max(churn_rate, 1 - churn_rate):.3f}")
+
+    return X_train, X_test, y_train, y_test, X_lr_train, X_lr_test, df_ood

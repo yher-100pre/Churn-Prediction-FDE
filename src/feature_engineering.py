@@ -41,6 +41,7 @@ Label   = zero sessions in [CUTOFF, AS_OF]  ->  churned (1), else retained (0).
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -58,7 +59,124 @@ CUTOFF = datetime(2024, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
 WINDOW_90D = CUTOFF - timedelta(days=90)  # 2024-02-01T12:00:00Z
 WINDOW_30D = CUTOFF - timedelta(days=30)  # 2024-04-01T12:00:00Z
 
+# Recency sentinel for customers with no session at all before CUTOFF. Kept far
+# outside the plausible range so the model can split it off as its own regime
+# instead of treating "never seen" as "seen a long time ago".
+NO_SESSION_RECENCY = 999.0
+
 
 def parse_ts(ts_str: str) -> datetime:
     """Parse an ISO-8601 timestamp (trailing 'Z' allowed) to a UTC-aware datetime."""
     return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def build_features(events: list[dict]) -> pd.DataFrame:
+    """Collapse a raw event stream into a per-customer RFM + engagement table.
+
+    One row per customer_id. The label comes only from the label window
+    [CUTOFF, AS_OF); every feature comes only from events strictly before
+    CUTOFF, so no post-CUTOFF signal can reach the model (see module docstring).
+    """
+    # Group first so each customer's timeline can be bucketed independently.
+    by_customer: dict[str, list[dict]] = defaultdict(list)
+    for event in events:
+        # Parse once per event, carried on a shallow copy so the caller's dicts
+        # are left untouched.
+        by_customer[event["customer_id"]].append(dict(event, _ts=parse_ts(event["timestamp"])))
+
+    rows: list[dict] = []
+    for customer_id, customer_events in by_customer.items():
+        # --- Time buckets -----------------------------------------------------
+        pre_cutoff = [e for e in customer_events if e["_ts"] < CUTOFF]
+        label_window = [e for e in customer_events if CUTOFF <= e["_ts"] < AS_OF]
+        w30 = [e for e in pre_cutoff if e["_ts"] >= WINDOW_30D]
+        w90 = [e for e in pre_cutoff if e["_ts"] >= WINDOW_90D]
+
+        # --- Label (computed first, from the label window only) ---------------
+        # Churn definition: no session at all in the observation window means the
+        # customer stopped opening the app, i.e. churned.
+        label_sessions = [e for e in label_window if e["event_type"] == "session"]
+        churned = 1 if len(label_sessions) == 0 else 0
+
+        # --- Features (pre-CUTOFF events only) --------------------------------
+        pre_sessions = [e for e in pre_cutoff if e["event_type"] == "session"]
+
+        # RECENCY: a long silence before the cutoff is the single strongest churn
+        # signal -- disengagement almost always shows up as a growing gap first.
+        if pre_sessions:
+            last_session_ts = max(e["_ts"] for e in pre_sessions)
+            recency_days = (CUTOFF - last_session_ts).total_seconds() / 86400.0
+        else:
+            recency_days = NO_SESSION_RECENCY  # never active pre-cutoff: maximal churn risk
+
+        # FREQUENCY (30d): recent habit strength -- a customer still opening the
+        # app last month is far likelier to open it next month.
+        freq_30d = sum(1 for e in w30 if e["event_type"] == "session")
+
+        # FREQUENCY (90d): longer-horizon baseline; separates a genuine regular
+        # from a one-off spike, and pairs with freq_30d to expose a slowdown.
+        freq_90d = sum(1 for e in w90 if e["event_type"] == "session")
+
+        w90_purchases = [e for e in w90 if e["event_type"] == "purchase"]
+
+        # MONETARY (90d): spend is committed value -- paying customers have
+        # sunk cost and switching friction, so they churn less than free riders.
+        monetary_90d = float(sum(e.get("properties", {}).get("amount_usd", 0.0) for e in w90_purchases))
+
+        # PURCHASE COUNT (90d): repeat buying beats one big order -- a habit of
+        # transacting signals ongoing intent, not a single impulse.
+        purchase_count_90d = len(w90_purchases)
+
+        # SESSION DEPTH: short sessions mean shallow engagement; average dwell
+        # time falling off is an early warning that precedes outright silence.
+        avg_session_duration = (
+            float(sum(e.get("properties", {}).get("duration_sec", 0.0) for e in pre_sessions)) / len(pre_sessions)
+            if pre_sessions
+            else 0.0
+        )
+
+        push_sent_count = sum(1 for e in pre_cutoff if e["event_type"] == "push_sent")
+        push_open_count = sum(1 for e in pre_cutoff if e["event_type"] == "push_open")
+        campaign_click_count = sum(1 for e in pre_cutoff if e["event_type"] == "campaign_click")
+
+        # PUSH RESPONSIVENESS: ignoring notifications shows the app has lost
+        # mindshare -- reachability decays before usage does.
+        push_open_rate = push_open_count / push_sent_count if push_sent_count else 0.0
+
+        # CAMPAIGN RESPONSIVENESS: clicking through to content is stronger
+        # intent than merely opening a push; near-zero means marketing can no
+        # longer pull the customer back, which is what makes churn stick.
+        click_denominator = push_sent_count + campaign_click_count
+        campaign_click_rate = campaign_click_count / click_denominator if click_denominator else 0.0
+
+        # FRICTION: support tickets are logged dissatisfaction (billing disputes,
+        # bugs) -- unresolved pain is a leading cause of voluntary churn.
+        support_ticket_count = sum(1 for e in pre_cutoff if e["event_type"] == "support_ticket")
+
+        rows.append(
+            {
+                "customer_id": customer_id,
+                "recency_days": recency_days,
+                "freq_30d": freq_30d,
+                "freq_90d": freq_90d,
+                "monetary_90d": monetary_90d,
+                "purchase_count_90d": purchase_count_90d,
+                "avg_session_duration": avg_session_duration,
+                "push_open_rate": push_open_rate,
+                "campaign_click_rate": campaign_click_rate,
+                "support_ticket_count": support_ticket_count,
+                "churned": churned,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        print("build_features: no events supplied -- empty feature table.")
+        return df
+
+    print(f"Customers: {len(df)}")
+    print(f"Churn rate: {df['churned'].mean() * 100:.1f}%")
+    print(f"Feature means: {df.describe().loc['mean'].round(2).to_dict()}")
+
+    return df

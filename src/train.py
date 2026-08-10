@@ -86,6 +86,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+import joblib
 import matplotlib
 import numpy as np
 import pandas as pd
@@ -172,6 +173,13 @@ LR_RECENCY_CAP = 365.0
 # --- Explainability ----------------------------------------------------------
 # All nine features fit on one SHAP summary plot, so nothing is truncated.
 SHAP_MAX_DISPLAY = 9
+
+# --- Paths -------------------------------------------------------------------
+DEFAULT_FEATURES_IN = "data/training_features.parquet"
+DEFAULT_OUTPUT_DIR = "models"
+# The 80 raw customers, held back from training entirely and scored at the end as
+# an out-of-distribution check (see main).
+DEFAULT_RAW_EVENTS = "data/events.json"
 
 
 def load_and_split(
@@ -1002,3 +1010,781 @@ def _save_plot(path: Path) -> None:
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close("all")
+
+
+# --- Fairness ----------------------------------------------------------------
+# The control dimension: SEGMENT_CHURN_TARGETS in generate_synthetic assigns it no
+# churn modifier, so whatever FNR spread it shows is pure noise. That measured
+# spread becomes the yardstick for every other dimension -- far more defensible
+# than an arbitrary rule of thumb like the 80% rule, because it is calibrated on
+# this model, this sample size and this threshold.
+FAIRNESS_CONTROL_COL = "region"
+
+# 95% two-sided normal quantile, for the Wilson score interval.
+WILSON_Z = 1.959963985
+
+
+def _wilson_interval(successes: int, total: int, z: float = WILSON_Z) -> tuple[float, float]:
+    """95% Wilson score interval for a proportion.
+
+    Wilson rather than the textbook normal approximation because the group counts
+    here are small and the rates are far from 0.5 -- exactly where the normal
+    interval misbehaves, running past 0 or 1 and understating uncertainty. Wilson
+    stays inside [0, 1] and holds its coverage at small n, which is the whole
+    point when a subgroup cell has 40 churners in it.
+    """
+    if total == 0:
+        return (float("nan"), float("nan"))
+    p = successes / total
+    denominator = 1.0 + z**2 / total
+    center = (p + z**2 / (2 * total)) / denominator
+    half = (z / denominator) * np.sqrt(p * (1 - p) / total + z**2 / (4 * total**2))
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def fairness_audit(
+    model: xgb.XGBClassifier,
+    threshold: float,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    df_test_segments: pd.DataFrame,
+    output_dir: str | Path,
+) -> tuple[pd.DataFrame, float]:
+    """Audit false-negative rates across synthetic segments. Returns (fairness_df, noise_floor).
+
+    Criterion: EQUAL OPPORTUNITY -- equal FNR (equivalently, equal recall) across
+    groups. Justified in the printed output and in fairness.json.
+
+    Measured at the frozen operating threshold, not on the raw scores, because a
+    customer either receives the retention campaign or does not. A model can rank
+    well in aggregate and still miss one group disproportionately once a single
+    cut-off is applied to everyone, and it is the cut-off that determines who is
+    actually helped.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Align segments to the test rows. Reindex rather than assume: a silent row
+    # misalignment here would attribute each customer's outcome to the wrong
+    # group and produce a confident, entirely fictional fairness finding.
+    segments = df_test_segments.reindex(X_test.index)
+    missing_segments = int(segments[SEGMENT_COLS].isna().all(axis=1).sum())
+    if missing_segments:
+        print(f"  NOTE: {missing_segments} test rows have no segment data and are excluded per-slice.")
+
+    y_true = y_test.to_numpy()
+    scores = model.predict_proba(X_test)[:, 1]
+    pred = (scores >= threshold).astype(int)
+
+    rows: list[dict] = []
+    for segment_col in SEGMENT_COLS:
+        if segment_col not in segments.columns:
+            continue
+        values = segments[segment_col]
+        for group in sorted(v for v in values.dropna().unique()):
+            mask = (values == group).to_numpy()
+            g_true, g_pred = y_true[mask], pred[mask]
+
+            tp = int(((g_true == 1) & (g_pred == 1)).sum())
+            fn = int(((g_true == 1) & (g_pred == 0)).sum())
+            fp = int(((g_true == 0) & (g_pred == 1)).sum())
+            tn = int(((g_true == 0) & (g_pred == 0)).sum())
+
+            churners = tp + fn
+            retained = fp + tn
+            # FNR: of the churners in this group, what share did we fail to
+            # contact? This is the harm metric -- see the criterion note below.
+            fnr = fn / churners if churners else float("nan")
+            fnr_lo, fnr_hi = _wilson_interval(fn, churners)
+
+            # Counterfactual FNR if this group were contacted at exactly the
+            # campaign rate instead of sharing one global cut-off. The difference
+            # between the two isolates how much of any gap is base-rate
+            # arithmetic and how much is the model treating groups differently.
+            g_scores = scores[mask]
+            k_group = int(round(TARGET_SELECTION_RATE * int(mask.sum())))
+            eq_pred = np.zeros(int(mask.sum()), dtype=int)
+            eq_pred[np.argsort(-g_scores, kind="stable")[:k_group]] = 1
+            fn_eq = int(((g_true == 1) & (eq_pred == 0)).sum())
+            fnr_eq = fn_eq / churners if churners else float("nan")
+
+            # Within-group ranking quality. This is the ONLY fully base-rate-free
+            # measure available: it asks whether the model orders this group's
+            # churners above its non-churners as well as it does for any other
+            # group, and it is unaffected by how many churners the group contains
+            # or how many of them the budget can reach. FNR -- even at equal
+            # selection -- cannot do this, because the minimum achievable FNR is
+            # itself a function of base rate (1 - rate/base_rate).
+            if churners and retained:
+                auc_within = float(roc_auc_score(g_true, g_scores))
+                ceiling = min(1.0, TARGET_SELECTION_RATE / g_true.mean())
+                recall_vs_ceiling = float((1.0 - fnr_eq) / ceiling) if ceiling else float("nan")
+            else:
+                auc_within = float("nan")
+                recall_vs_ceiling = float("nan")
+
+            rows.append({
+                "segment": segment_col,
+                "group": group,
+                "n": int(mask.sum()),
+                "n_churners": churners,
+                "base_rate": float(g_true.mean()) if mask.sum() else float("nan"),
+                "fnr": fnr,
+                "fnr_ci_low": fnr_lo,
+                "fnr_ci_high": fnr_hi,
+                "fnr_equal_selection": fnr_eq,
+                "auc_within_group": auc_within,
+                "recall_vs_ceiling": recall_vs_ceiling,
+                "fpr": fp / retained if retained else float("nan"),
+                "selection_rate": float(g_pred.mean()) if mask.sum() else float("nan"),
+                "precision": tp / (tp + fp) if (tp + fp) else float("nan"),
+                "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            })
+
+    fairness_df = pd.DataFrame(rows)
+
+    # --- Noise floor ---------------------------------------------------------
+    control = fairness_df[fairness_df["segment"] == FAIRNESS_CONTROL_COL]
+    noise_floor = float(control["fnr"].max() - control["fnr"].min()) if not control.empty else float("nan")
+    # Separate floor for the equal-selection view: a spread measured under
+    # per-group thresholds must be judged against a control measured the same
+    # way, or the comparison mixes two different sampling regimes.
+    noise_floor_equal = (
+        float(control["fnr_equal_selection"].max() - control["fnr_equal_selection"].min())
+        if not control.empty else float("nan")
+    )
+    # The bias yardstick. Residual bias is judged on within-group AUC spread
+    # against this, NOT on either FNR spread -- both of those stay confounded by
+    # base rate (see the auc_within_group comment above).
+    control_auc_spread = (
+        float(control["auc_within_group"].max() - control["auc_within_group"].min())
+        if not control.empty else float("nan")
+    )
+
+    print("\n" + "=" * 78)
+    print("FAIRNESS AUDIT")
+    print("=" * 78)
+    print(f"Criterion: EQUAL OPPORTUNITY (equal FNR across groups), at threshold p >= {threshold:.4f}.")
+    print(f"Noise floor ('{FAIRNESS_CONTROL_COL}' control): {noise_floor:.4f} FNR spread at global threshold.")
+    print(f"Bias metric: within-group ROC-AUC; control spread {control_auc_spread:.4f}, "
+          f"flag above 2x = {2 * control_auc_spread:.4f}.")
+
+    # Control first: the yardstick has to exist before anything is measured
+    # against it, so the tables are ordered control-first rather than in
+    # SEGMENT_COLS order.
+    ordered = [FAIRNESS_CONTROL_COL] + [c for c in SEGMENT_COLS if c != FAIRNESS_CONTROL_COL]
+    for segment_col in ordered:
+        block = fairness_df[fairness_df["segment"] == segment_col]
+        if block.empty:
+            continue
+        block = block.sort_values("fnr", ascending=False)
+
+        print(f"\n--- {segment_col} ---")
+        print(f"{'group':<14} {'n':>5} {'churn':>6} {'base':>7} {'FNR':>7} {'FNR 95% CI':>16} "
+              f"{'FNR@eq':>7} {'AUC':>7} {'FPR':>7} {'sel':>7} {'prec':>7}")
+        for row in block.itertuples():
+            ci = f"[{row.fnr_ci_low:.3f}, {row.fnr_ci_high:.3f}]"
+            print(f"{str(row.group):<14} {row.n:>5} {row.n_churners:>6} {row.base_rate:>7.3f} "
+                  f"{row.fnr:>7.3f} {ci:>16} {row.fnr_equal_selection:>7.3f} "
+                  f"{row.auc_within_group:>7.4f} {row.fpr:>7.3f} "
+                  f"{row.selection_rate:>7.3f} {row.precision:>7.3f}")
+
+        _print_fairness_interpretation(segment_col, block, noise_floor, control_auc_spread)
+
+    _print_impossibility_note(fairness_df, noise_floor, noise_floor_equal)
+    _print_fairness_criterion()
+    _print_fairness_caveats(fairness_df, noise_floor)
+
+    payload = {
+        "criterion": "equal_opportunity",
+        "criterion_definition": "Equal false-negative rate (equivalently, equal recall) across groups.",
+        "criterion_rationale": (
+            "The score selects who receives a retention intervention. A false negative is a "
+            "churner who is never contacted and leaves -- the cost is that customer's lifetime "
+            "value, and it is invisible because the counterfactual is never observed. A false "
+            "positive is a retained customer who receives an offer they did not need, costing "
+            "marginal campaign spend. Unequal FNR therefore means one group is systematically "
+            "denied access to the intervention. Demographic parity (equal selection rate) is "
+            "rejected: base churn rates genuinely differ across these groups, so equalising "
+            "selection would over-contact low-churn groups and under-contact high-churn ones, "
+            "making outcomes worse for the group already churning most."
+        ),
+        "bias_metric": "within-group ROC-AUC vs region control",
+        "bias_metric_rationale": (
+            "FNR is confounded by base rate at a global threshold (through the selection rate) "
+            "and even at equal selection (through the achievable ceiling, min FNR = "
+            "1 - rate/base_rate). Within-group AUC is free of both. Verdict threshold is 2x the "
+            "control's own AUC spread."
+        ),
+        "control_auc_spread": control_auc_spread,
+        "bias_flag_threshold": 2.0 * control_auc_spread,
+        "chouldechova_note": "FNR gaps are base-rate-explained, not model bias",
+        "impossibility_result": (
+            "Chouldechova 2017 -- calibration and equal_opportunity cannot simultaneously hold "
+            "with unequal base rates. Model optimized for calibration."
+        ),
+        "plan_tier_fnr_global": (
+            float(fairness_df[fairness_df["segment"] == "plan_tier"]["fnr"].max()
+                  - fairness_df[fairness_df["segment"] == "plan_tier"]["fnr"].min())
+            if "plan_tier" in set(fairness_df["segment"]) else None
+        ),
+        "plan_tier_fnr_equal_selection": (
+            float(fairness_df[fairness_df["segment"] == "plan_tier"]["fnr_equal_selection"].max()
+                  - fairness_df[fairness_df["segment"] == "plan_tier"]["fnr_equal_selection"].min())
+            if "plan_tier" in set(fairness_df["segment"]) else None
+        ),
+        "noise_floor_region": noise_floor,
+        "threshold": float(threshold),
+        "noise_floor_fnr_spread": noise_floor,
+        "noise_floor_fnr_spread_equal_selection": noise_floor_equal,
+        "noise_floor_source": FAIRNESS_CONTROL_COL,
+        "caveats": [
+            "Segments are SYNTHETIC (invented in generate_synthetic). Findings describe this "
+            "pipeline's ability to DETECT a subgroup gap, not real-world bias.",
+            f"'{FAIRNESS_CONTROL_COL}' carries no generative churn modifier and is the control: "
+            f"its FNR spread of {noise_floor:.4f} is the empirical noise floor.",
+            "acquisition_channel may be underpowered: its middle groups are separated by less "
+            "than the noise floor by construction. Check n_churners per cell before concluding.",
+        ],
+        "segments": {
+            col: {
+                "fnr_spread": float(
+                    fairness_df[fairness_df["segment"] == col]["fnr"].max()
+                    - fairness_df[fairness_df["segment"] == col]["fnr"].min()
+                ),
+                "fnr_spread_equal_selection": float(
+                    fairness_df[fairness_df["segment"] == col]["fnr_equal_selection"].max()
+                    - fairness_df[fairness_df["segment"] == col]["fnr_equal_selection"].min()
+                ),
+                "exceeds_noise_floor": bool(
+                    (fairness_df[fairness_df["segment"] == col]["fnr"].max()
+                     - fairness_df[fairness_df["segment"] == col]["fnr"].min()) > noise_floor
+                ),
+                "residual_bias_after_equal_selection": bool(
+                    (fairness_df[fairness_df["segment"] == col]["fnr_equal_selection"].max()
+                     - fairness_df[fairness_df["segment"] == col]["fnr_equal_selection"].min())
+                    > noise_floor_equal
+                ),
+                "groups": fairness_df[fairness_df["segment"] == col].to_dict(orient="records"),
+            }
+            for col in fairness_df["segment"].unique()
+        },
+    }
+    # Per-segment verdicts, derived rather than hardcoded: a verdict string that
+    # does not move with the data is worse than no verdict at all.
+    for segment_col in fairness_df["segment"].unique():
+        if segment_col == FAIRNESS_CONTROL_COL:
+            continue
+        block = fairness_df[fairness_df["segment"] == segment_col]
+        verdict, auc_spread, multiple = _bias_verdict(block, control_auc_spread)
+        rc_spread = float(block["recall_vs_ceiling"].max() - block["recall_vs_ceiling"].min())
+        control_rc = fairness_df[fairness_df["segment"] == FAIRNESS_CONTROL_COL]
+        control_rc_spread = float(control_rc["recall_vs_ceiling"].max() - control_rc["recall_vs_ceiling"].min())
+        if verdict == "NO RESIDUAL BIAS":
+            detail = f"{verdict} -- AUC spread {multiple:.1f}x control, within noise"
+        else:
+            within = "within" if rc_spread <= control_rc_spread else "above"
+            detail = (f"INCONCLUSIVE -- AUC spread {multiple:.1f}x control but recall/ceiling "
+                      f"{within} noise")
+        payload[f"{segment_col}_bias_verdict"] = detail
+        payload["segments"][segment_col]["auc_spread"] = auc_spread
+        payload["segments"][segment_col]["auc_spread_vs_control"] = multiple
+        payload["segments"][segment_col]["bias_verdict"] = detail
+
+    with (output_dir / "fairness.json").open("w") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"\nWrote: fairness.json -> {output_dir}")
+
+    return fairness_df, noise_floor
+
+
+def _bias_verdict(block: pd.DataFrame, control_auc_spread: float) -> tuple[str, float, float]:
+    """Judge residual bias on within-group AUC. Returns (verdict, auc_spread, multiple).
+
+    FNR is reported but never used for this verdict. Both FNR views stay
+    confounded by base rate -- at a global threshold through the selection rate,
+    and even at equal selection through the achievable ceiling
+    (min FNR = 1 - rate/base_rate). AUC is free of both: it measures only whether
+    the model orders a group's churners above its non-churners.
+
+    The threshold is 2x the control's own spread. The control has no real effect,
+    so its spread is what pure sampling noise produces at these cell sizes;
+    anything within 2x of that is not separable from noise.
+    """
+    auc_spread = float(block["auc_within_group"].max() - block["auc_within_group"].min())
+    multiple = auc_spread / control_auc_spread if control_auc_spread else float("inf")
+    verdict = "NO RESIDUAL BIAS" if multiple <= 2.0 else "FLAG FOR REVIEW"
+    return verdict, auc_spread, multiple
+
+
+def _print_fairness_interpretation(
+    segment_col: str, block: pd.DataFrame, noise_floor: float, control_auc_spread: float
+) -> None:
+    """Report both FNR views for the record, then judge bias on AUC alone.
+
+    The FNR columns stay because the global-threshold FNR is real production harm
+    regardless of what causes it: those churners genuinely go uncontacted. What
+    changed is that the harm measure no longer doubles as the bias verdict.
+    """
+    spread = float(block["fnr"].max() - block["fnr"].min())
+    spread_equal = float(block["fnr_equal_selection"].max() - block["fnr_equal_selection"].min())
+    auc_spread = float(block["auc_within_group"].max() - block["auc_within_group"].min())
+
+    if segment_col == FAIRNESS_CONTROL_COL:
+        print(f"  CONTROL. FNR spread {spread:.4f} (global), {spread_equal:.4f} (equal selection); "
+              f"within-group AUC spread {auc_spread:.4f}.")
+        print(f"  No generative churn modifier here, so these are the empirical NOISE FLOORS. "
+              f"Residual bias\n  elsewhere is judged against 2x the AUC spread "
+              f"({2 * auc_spread:.4f}).")
+        return
+
+    verdict, _, multiple = _bias_verdict(block, control_auc_spread)
+    worst_auc = block.loc[block["auc_within_group"].idxmin()]
+    best_auc = block.loc[block["auc_within_group"].idxmax()]
+
+    print(f"  FNR gap at global threshold: {spread:.3f} "
+          f"({'exceeds' if spread > noise_floor else 'within'} noise floor {noise_floor:.3f}) "
+          f"-- production harm, base-rate-driven")
+    print(f"  FNR gap at equal selection:  {spread_equal:.3f} (reported only; still "
+          f"base-rate-confounded via the FNR ceiling)")
+    print(f"  Within-group AUC spread:     {auc_spread:.4f} = {multiple:.1f}x control "
+          f"-> {verdict}")
+
+    if verdict == "NO RESIDUAL BIAS":
+        print(f"  -> The model ranks every group's churners about equally well "
+              f"({worst_auc['group']} {worst_auc['auc_within_group']:.4f} .. "
+              f"{best_auc['group']} {best_auc['auc_within_group']:.4f}).")
+        print(f"     The FNR gap is base-rate arithmetic under one global cut-off, not bias.")
+    else:
+        print(f"  -> The model ranks '{worst_auc['group']}' churners worse "
+              f"({worst_auc['auc_within_group']:.4f}) than '{best_auc['group']}' "
+              f"({best_auc['auc_within_group']:.4f}),")
+        print(f"     beyond what the control's noise explains. Investigate before shipping.")
+
+
+def _print_impossibility_note(fairness_df: pd.DataFrame, noise_floor: float, noise_floor_equal: float) -> None:
+    """Name the result driving the plan_tier gap, so it is not mistaken for bias."""
+    tier = fairness_df[fairness_df["segment"] == "plan_tier"]
+    if tier.empty:
+        return
+    spread = float(tier["fnr"].max() - tier["fnr"].min())
+    spread_equal = float(tier["fnr_equal_selection"].max() - tier["fnr_equal_selection"].min())
+
+    print("\n--- Impossibility result ---")
+    print("Calibration and equal FNR cannot simultaneously hold when base rates differ")
+    print("(Chouldechova 2017). This model is calibrated. The plan_tier FNR gap is")
+    print("arithmetic, not bias. Remedy: per-group thresholds -- business decision.")
+    print(f"\n  plan_tier FNR gap: {spread:.3f} at global threshold "
+          f"(floor {noise_floor:.3f}), {spread_equal:.3f} at equal selection "
+          f"(floor {noise_floor_equal:.3f}).")
+    print("  Per-group thresholds would close it, at the cost of contacting lower-risk")
+    print("  premium customers ahead of higher-risk free-tier ones -- less efficient use of")
+    print("  a fixed budget. Which matters more is a business call, not a modelling one.")
+
+
+def _print_fairness_criterion() -> None:
+    """State the criterion and why the obvious alternative is wrong here."""
+    print("\n--- Criterion ---")
+    print("EQUAL OPPORTUNITY (equal FNR across groups) is the criterion.")
+    print("  A false negative is a churner who is never contacted, leaves, and is never")
+    print("  counted -- the cost is their lifetime value. A false positive is a retained")
+    print("  customer who gets an offer they did not need -- the cost is marginal campaign")
+    print("  spend. Cost(FN) >> cost(FP), so an FNR gap means one group is systematically")
+    print("  DENIED the retention offer. That is the harm worth measuring.")
+    print("\nDEMOGRAPHIC PARITY (equal selection rate) is rejected, and would be actively")
+    print("  harmful here. Base churn rates genuinely differ across these groups. Forcing")
+    print("  equal selection would contact low-churn groups beyond what their risk warrants")
+    print("  and starve high-churn groups of contact -- making outcomes worse for exactly the")
+    print("  group already churning most, in the name of fairness.")
+
+
+def _print_fairness_caveats(fairness_df: pd.DataFrame, noise_floor: float) -> None:
+    """The three caveats, printed rather than left to the JSON nobody opens."""
+    channel = fairness_df[fairness_df["segment"] == "acquisition_channel"]
+    min_churners = int(channel["n_churners"].min()) if not channel.empty else 0
+
+    print("\n--- Caveats ---")
+    print("(a) Segments are SYNTHETIC -- invented in generate_synthetic, with churn")
+    print("    associations written in by hand. Every finding here is a statement about this")
+    print("    pipeline's ability to DETECT a subgroup gap, not evidence of real-world bias.")
+    print(f"(b) '{FAIRNESS_CONTROL_COL}' is the control: no generative churn modifier, so its")
+    print(f"    FNR spread of {noise_floor:.4f} is the noise floor, not a finding. A gap in")
+    print("    another segment only means something if it clears this.")
+    print(f"(c) acquisition_channel is likely UNDERPOWERED: smallest cell has {min_churners}")
+    print("    churners, and its middle groups are separated by less than the noise floor by")
+    print("    construction. Read its ordering as indicative only; the endpoints are the only")
+    print("    contrast the sample size supports.")
+
+
+def score_ood(model: xgb.XGBClassifier, threshold: float, df_ood: pd.DataFrame,
+              raw_events_path: str | Path, synthetic_churn_rate: float) -> dict:
+    """Score the held-out raw customers as an out-of-distribution sanity check.
+
+    The 80 raw customers never touch training, the split, the threshold or the
+    audit. Scoring them last answers the one question the synthetic pipeline
+    cannot answer about itself: does a model fitted entirely on generated data
+    behave sensibly on the real events it was modelled from?
+
+    df_ood comes from load_and_split when the feature table happens to contain
+    real rows. With a synthetic-only table it is empty, so the raw events are
+    transformed here instead -- through the SAME build_features used in training,
+    which is the point: any drift between the two paths would show up as nonsense
+    predictions rather than hiding.
+    """
+    print("\n" + "=" * 78)
+    print("OUT-OF-DISTRIBUTION CHECK (raw sample)")
+    print("=" * 78)
+
+    if df_ood is None or df_ood.empty:
+        raw_events_path = Path(raw_events_path)
+        if not raw_events_path.exists():
+            print(f"  Skipped: {raw_events_path} not found.")
+            return {"status": "skipped", "reason": f"{raw_events_path} not found"}
+        with raw_events_path.open() as fh:
+            raw_events = json.load(fh)
+        print(f"  Building features from {len(raw_events)} raw events in {raw_events_path}")
+        df_ood = build_features(raw_events)
+
+    if df_ood.empty:
+        print("  Skipped: no OOD customers.")
+        return {"status": "skipped", "reason": "no OOD rows"}
+
+    X_ood = df_ood[FEATURE_COLS].astype(float)
+    y_ood = df_ood[TARGET_COL].astype(int).to_numpy()
+    scores = model.predict_proba(X_ood)[:, 1]
+    pred = (scores >= threshold).astype(int)
+
+    actual_rate = float(y_ood.mean())
+    result = {
+        "status": "ok",
+        "n": int(len(df_ood)),
+        "actual_churn_rate": actual_rate,
+        "synthetic_test_churn_rate": float(synthetic_churn_rate),
+        "churn_rate_delta": actual_rate - float(synthetic_churn_rate),
+        "mean_predicted_score": float(scores.mean()),
+        "selection_rate_at_threshold": float(pred.mean()),
+        "recall": float(recall_score(y_ood, pred, zero_division=0)),
+        "precision": float(precision_score(y_ood, pred, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_ood, scores)) if len(set(y_ood)) > 1 else None,
+    }
+
+    print(f"\n  Raw customers scored:        {result['n']}")
+    print(f"  Actual churn rate (raw):     {actual_rate:.4f}")
+    print(f"  Synthetic test churn rate:   {synthetic_churn_rate:.4f}   "
+          f"(delta {result['churn_rate_delta']:+.4f})")
+    print(f"  Mean predicted score:        {result['mean_predicted_score']:.4f}")
+    print(f"  Selection rate at threshold: {result['selection_rate_at_threshold']:.4f}")
+    if result["roc_auc"] is not None:
+        print(f"  ROC-AUC on raw sample:       {result['roc_auc']:.4f}")
+    print(f"  Recall {result['recall']:.4f}   Precision {result['precision']:.4f}")
+
+    # A close churn rate says the generator reproduced the label prevalence; a
+    # ROC-AUC in the same neighbourhood as the synthetic test says the learned
+    # signal transfers. Either one drifting far is the finding.
+    if abs(result["churn_rate_delta"]) > 0.10:
+        print(f"\n  WARNING: raw churn rate differs from synthetic by "
+              f"{abs(result['churn_rate_delta']):.3f} -- the generator's label")
+        print("  prevalence does not match the real sample. Revisit the generative constants.")
+
+    return result
+
+
+def _git_sha() -> str | None:
+    """Short git SHA of the working tree, or None outside a repo."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def _file_sha256(path: Path) -> str | None:
+    """Content hash of the training input, so a model can be tied to its data."""
+    if not path.exists():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def save_artifacts(
+    output_dir: Path,
+    model: xgb.XGBClassifier,
+    lr_pipeline: Pipeline,
+    threshold: float,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    metrics: dict,
+    features_path: Path,
+    seed: int,
+    ood: dict,
+) -> dict:
+    """Write every artifact the service and the reviewer need. Returns {name: path}."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+
+    # --- Model, native format -----------------------------------------------
+    # save_model, not pickle: the booster JSON is portable across xgboost
+    # versions, while a pickled sklearn wrapper breaks the moment the serving
+    # container's library version drifts from the training one.
+    paths["model"] = output_dir / "churn_model.json"
+    model.save_model(paths["model"])
+
+    paths["baseline_lr"] = output_dir / "baseline_lr.joblib"
+    joblib.dump(lr_pipeline, paths["baseline_lr"])
+
+    # --- Feature spec --------------------------------------------------------
+    recency = X_train["recency_days"]
+    sentinel_share = float((recency == NO_SESSION_RECENCY).mean())
+    real_recency = recency[recency != NO_SESSION_RECENCY]
+    feature_spec = {
+        "feature_cols": FEATURE_COLS,
+        "n_features": len(FEATURE_COLS),
+        "dtypes": {col: str(X_train[col].dtype) for col in FEATURE_COLS},
+        "column_order_is_contractual": (
+            "The service MUST assemble its matrix in this exact order. XGBoost indexes "
+            "features positionally; a reordered matrix scores silently and wrongly."
+        ),
+        "cutoff": CUTOFF.isoformat(),
+        "as_of": AS_OF.isoformat(),
+        "cutoff_meaning": (
+            "All training features are anchored at CUTOFF: recency is days since the last "
+            "session BEFORE CUTOFF, and the 30d/90d windows end there. The label comes only "
+            "from [CUTOFF, AS_OF), so no post-cutoff activity can reach a feature."
+        ),
+        "no_session_recency_sentinel": NO_SESSION_RECENCY,
+        "sentinel_meaning": (
+            "Customers with no session before CUTOFF get this literal value, not a computed "
+            "distance. XGBoost splits it into its own regime; linear models must handle it "
+            "separately (see LR_NO_SESSION_COL)."
+        ),
+        "training_recency_distribution": {
+            "mean": float(recency.mean()),
+            "p50": float(recency.quantile(0.50)),
+            "p90": float(recency.quantile(0.90)),
+            "sentinel_share": sentinel_share,
+            "mean_excluding_sentinel": float(real_recency.mean()) if len(real_recency) else None,
+            "p90_excluding_sentinel": float(real_recency.quantile(0.90)) if len(real_recency) else None,
+        },
+        "train_serve_skew_note": (
+            "EXPECTED DRIFT, not a bug. Training anchors recency at CUTOFF; production scoring "
+            "anchors it at the current date, and the gap between now and CUTOFF grows every day "
+            "the model stays deployed. Monitor live recency against training_recency_distribution "
+            "above and alarm on divergence -- a rising p50 means the feature distribution has "
+            "moved out from under the model, and the threshold with it."
+        ),
+    }
+    paths["feature_spec"] = output_dir / "feature_spec.json"
+    with paths["feature_spec"].open("w") as fh:
+        json.dump(feature_spec, fh, indent=2)
+
+    # --- Threshold -----------------------------------------------------------
+    xgb_block = metrics.get("xgboost", {})
+    threshold_spec = {
+        "threshold": float(threshold),
+        "policy": (
+            "top-K rank selection for batch; threshold as fallback for single-customer scoring"
+        ),
+        "target_selection_rate": TARGET_SELECTION_RATE,
+        "training_realized_rate": xgb_block.get("val_selection_rate"),
+        "test_realized_rate": xgb_block.get("selection_rate"),
+        "tie_structure_note": (
+            f"{xgb_block.get('best_iteration', 0) + 1} shallow trees produce clustered scores; "
+            ">= cut systematically overshoots budget by 5-16%; rank selection guarantees budget "
+            "exactly"
+        ),
+        "monitoring_alert": "raise alert if realized batch selection rate drifts >5% from target",
+        "batch_scoring": (
+            "Rank customers by score and take the top K = round(target_selection_rate * N). "
+            "This guarantees the campaign budget exactly, which a probability cut-off cannot."
+        ),
+        "single_customer_scoring": (
+            "No batch to rank against, so compare the score to `threshold` directly and return "
+            "both the score and the comparison."
+        ),
+    }
+    paths["threshold"] = output_dir / "threshold.json"
+    with paths["threshold"].open("w") as fh:
+        json.dump(threshold_spec, fh, indent=2)
+
+    # --- Metrics -------------------------------------------------------------
+    paths["metrics"] = output_dir / "metrics.json"
+    with paths["metrics"].open("w") as fh:
+        json.dump({**metrics, "out_of_distribution_check": ood}, fh, indent=2)
+
+    # --- Model card ----------------------------------------------------------
+    churn_rate = float(y_train.mean())
+    model_card = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "git_sha": _git_sha(),
+        "random_seed": seed,
+        "training_input": str(features_path),
+        "training_input_sha256": _file_sha256(features_path),
+        "n_train_rows": int(len(X_train)),
+        "class_balance": {
+            "churned": churn_rate,
+            "retained": 1.0 - churn_rate,
+            "majority_class": "churned" if churn_rate >= 0.5 else "retained",
+            "note": (
+                "Churn is the MAJORITY class. Accuracy has a floor equal to the majority rate, "
+                "and scale_pos_weight is pinned at 1.0 -- the usual neg/pos upweighting would "
+                "push an already-dominant class harder and distort the probabilities the "
+                "threshold policy reads."
+            ),
+        },
+        "features": FEATURE_COLS,
+        "segments_excluded_from_features": SEGMENT_COLS,
+        "synthetic_segments_note": (
+            "plan_tier, acquisition_channel and region are SYNTHETIC -- invented in "
+            "generate_synthetic.py, with churn associations assigned by hand. They are audit "
+            "dimensions only and are excluded from FEATURE_COLS. Every fairness finding is a "
+            "statement about this pipeline's ability to DETECT a subgroup gap, NOT evidence "
+            "about real-world bias."
+        ),
+        "chouldechova_note": (
+            "Calibration and equal FNR cannot simultaneously hold when base rates differ "
+            "(Chouldechova 2017). This model is optimised for calibration, so FNR gaps across "
+            "segments at a global threshold are base-rate arithmetic, not model bias. Residual "
+            "bias is judged on within-group ROC-AUC instead -- see fairness.json."
+        ),
+        "training_data_note": (
+            "Trained on synthetic customers only. The 80 raw customers are held out entirely "
+            "and scored as an out-of-distribution check; see out_of_distribution_check in "
+            "metrics.json."
+        ),
+    }
+    paths["model_card"] = output_dir / "model_card.json"
+    with paths["model_card"].open("w") as fh:
+        json.dump(model_card, fh, indent=2)
+
+    paths["fairness"] = output_dir / "fairness.json"  # written by fairness_audit
+    return paths
+
+
+def main() -> None:
+    """CLI: feature table -> trained model, baselines, explanations, audit, artifacts."""
+    # Declared up front because --n-top-k rebinds it below: the budget is a single
+    # policy value read by the baselines, the threshold derivation and the
+    # fairness audit alike, so it stays one source of truth rather than being
+    # threaded through five signatures.
+    global TARGET_SELECTION_RATE
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--features", default=DEFAULT_FEATURES_IN, help=f"Default: {DEFAULT_FEATURES_IN}")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help=f"Default: {DEFAULT_OUTPUT_DIR}")
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED, help=f"Default: {RANDOM_SEED}")
+    parser.add_argument("--test-size", type=float, default=TEST_SIZE, help=f"Default: {TEST_SIZE}")
+    parser.add_argument(
+        "--n-top-k",
+        type=float,
+        default=TARGET_SELECTION_RATE,
+        help=f"Campaign budget as a fraction of the base. Default: {TARGET_SELECTION_RATE}",
+    )
+    parser.add_argument("--raw-events", default=DEFAULT_RAW_EVENTS, help=f"Default: {DEFAULT_RAW_EVENTS}")
+    args = parser.parse_args()
+
+    if not 0.0 < args.n_top_k <= 1.0:
+        raise ValueError(f"--n-top-k must be a fraction in (0, 1]; got {args.n_top_k}")
+
+    TARGET_SELECTION_RATE = args.n_top_k
+
+    features_path = Path(args.features)
+    output_dir = Path(args.output_dir)
+
+    print("=" * 78)
+    print("CHURN MODEL TRAINING")
+    print("=" * 78)
+    print(f"features={features_path}  output={output_dir}  seed={args.seed}  "
+          f"test_size={args.test_size}  budget={TARGET_SELECTION_RATE:.0%}")
+
+    X_train, X_test, y_train, y_test, X_lr_train, X_lr_test, df_ood = load_and_split(
+        features_path, test_size=args.test_size, seed=args.seed
+    )
+
+    baseline_results, lr_pipeline = train_baselines(
+        X_train, X_lr_train, y_train, X_test, X_lr_test, y_test
+    )
+
+    model, threshold, xgb_metrics = train_xgboost(
+        X_train, X_test, y_train, y_test, seed=args.seed, baseline_results=baseline_results
+    )
+
+    compute_shap(model, X_test, output_dir, threshold=threshold)
+
+    segments = pd.read_parquet(features_path)[SEGMENT_COLS]
+    fairness_df, noise_floor = fairness_audit(model, threshold, X_test, y_test, segments, output_dir)
+
+    ood = score_ood(model, threshold, df_ood, args.raw_events, float(y_test.mean()))
+
+    metrics = {**baseline_results, **xgb_metrics}
+    paths = save_artifacts(
+        output_dir, model, lr_pipeline, threshold, X_train, y_train,
+        metrics, features_path, args.seed, ood,
+    )
+
+    _print_summary(metrics, fairness_df, noise_floor, ood, paths, threshold)
+
+
+def _print_summary(metrics: dict, fairness_df: pd.DataFrame, noise_floor: float,
+                   ood: dict, paths: dict, threshold: float) -> None:
+    """One block a reviewer can read without scrolling back through the run."""
+    xgb_block = metrics["xgboost"]
+    rule = metrics["baselines"]["recency_rule"]
+    matched = xgb_block.get("matched_audience_comparison", {})
+
+    print("\n" + "=" * 78)
+    print("SUMMARY")
+    print("=" * 78)
+
+    print(f"\nDATA      {metrics['test_n']} test rows, churn rate {metrics['test_churn_rate']:.4f} "
+          f"(accuracy floor {metrics['majority_class_accuracy_floor']:.4f})")
+    print(f"MODEL     XGBoost, {xgb_block['best_iteration'] + 1} trees, "
+          f"threshold p >= {threshold:.4f}, realised selection {xgb_block['selection_rate']:.3f}")
+
+    print(f"\nPERFORMANCE (test)")
+    print(f"  ROC-AUC              {xgb_block['roc_auc']:.4f}   (rule {rule['roc_auc']:.4f})")
+    print(f"  PR-AUC retention     {xgb_block['pr_auc_retention']:.4f}   (rule {rule['pr_auc_retention']:.4f})")
+    print(f"  PR-AUC churn         {xgb_block['pr_auc_churn']:.4f}")
+    print(f"  Recall               {xgb_block['recall']:.4f}   "
+          f"({xgb_block['pct_max_recall']:.0%} of max {metrics['max_achievable_recall']:.4f} "
+          f"reachable at {TARGET_SELECTION_RATE:.0%} budget)")
+    print(f"  Precision            {xgb_block['precision']:.4f}")
+    print(f"  Brier                {xgb_block['brier']:.4f}   (calibration)")
+    print(f"  Confusion            TN {xgb_block['confusion']['tn']}  FP {xgb_block['confusion']['fp']}  "
+          f"FN {xgb_block['confusion']['fn']}  TP {xgb_block['confusion']['tp']}")
+
+    if matched:
+        delta = matched.get("churners_found_delta", 0)
+        print(f"\nVERDICT   At equal {TARGET_SELECTION_RATE:.0%} budget XGBoost finds "
+              f"{abs(delta)} {'more' if delta >= 0 else 'fewer'} churners than the recency rule "
+              f"({matched['xgboost']['true_positives']} vs "
+              f"{matched['recency_rule']['true_positives']}),")
+        print(f"          on ROC-AUC {xgb_block['roc_auc'] - rule['roc_auc']:+.4f} better ranking.")
+
+    print(f"\nFAIRNESS  noise floor {noise_floor:.4f} (region control, FNR spread)")
+    for segment_col in fairness_df["segment"].unique():
+        if segment_col == FAIRNESS_CONTROL_COL:
+            continue
+        block = fairness_df[fairness_df["segment"] == segment_col]
+        control = fairness_df[fairness_df["segment"] == FAIRNESS_CONTROL_COL]
+        control_auc = float(control["auc_within_group"].max() - control["auc_within_group"].min())
+        verdict, auc_spread, multiple = _bias_verdict(block, control_auc)
+        print(f"  {segment_col:<22} AUC spread {auc_spread:.4f} ({multiple:.1f}x control) -> {verdict}")
+    print("  Segments are SYNTHETIC -- findings describe detection capability, not real-world bias.")
+
+    if ood.get("status") == "ok":
+        print(f"\nOOD CHECK {ood['n']} raw customers: churn {ood['actual_churn_rate']:.4f} vs "
+              f"synthetic {ood['synthetic_test_churn_rate']:.4f} "
+              f"({ood['churn_rate_delta']:+.4f})", end="")
+        print(f", ROC-AUC {ood['roc_auc']:.4f}" if ood.get("roc_auc") is not None else "")
+
+    print("\nARTIFACTS")
+    for name, path in sorted(paths.items()):
+        print(f"  {name:<14} {path}")
+
+
+if __name__ == "__main__":
+    main()

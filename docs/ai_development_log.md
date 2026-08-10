@@ -248,3 +248,60 @@ budget exactly). Frozen threshold retained as:
 threshold.json documents both roles explicitly. This changes 
 the service design: batch endpoint returns ranked list, 
 not binary predictions.
+
+**SHAP explainability**
+Six artifacts saved to models/. All nine features match 
+expected business direction — direction check passed 9/9.
+
+Key finding: freq_90d is dominant signal (mean|SHAP|=0.4163), 
+recency_days ranks fourth (0.0875). Explains ROC-AUC gain over 
+recency rule: 90-day session count is lower-variance proxy 
+for engagement than distance to a single timestamp.
+Story for writeup: "the rule watches one signal; the model 
+found a better-measured version of it."
+
+Base value sanity check: 0.5670 log-odds → sigmoid = 0.638 = 
+training churn rate to 3 decimal places. Confirms scale_pos_weight=1.0 
+left probabilities anchored to true prevalence. Reflex upweight 
+would have shifted the scale and broken threshold policy.
+
+avg_session_duration shows non-monotone SHAP (value/SHAP 
+correlation -0.747 vs -0.91 to -0.94 for other features) —
+interaction effect, depends on other features. Dependence plot 
+worth adding if fairness section reveals anomalies around it.
+
+Two additions accepted:
+- threshold parameter (needed for boundary case)
+- Direction check with expected vs actual sign comparison
+  Production value: catches silent sign flips in explainability
+
+  **Fairness audit, impossibility result finding**
+
+Initial "MEANINGFUL" verdict on plan_tier was threshold 
+arithmetic not model bias. Calibration check decisive:
+  premium: mean_pred=0.591, actual=0.558, gap=+0.033
+  basic:   mean_pred=0.648, actual=0.632, gap=+0.016
+  free:    mean_pred=0.661, actual=0.666, gap=-0.005
+Model is well-calibrated across all groups.
+
+FNR gap at global threshold (0.185) collapses to 0.024 under 
+equal per-group selection — below noise floor (0.131).
+Confirms gap is base-rate-explained, not residual model bias.
+
+This is the Chouldechova impossibility result: with unequal 
+base rates, calibration and equal FNR cannot both hold.
+Model has calibration. Equal opportunity is what yields.
+
+Remedy: per-group thresholds equalize FNR but contact lower-risk 
+premium customers over higher-risk free customers — trades 
+aggregate efficiency for equal opportunity. Business decision, 
+not a modelling one. Surfaced in output as such.
+
+Audit underpowered at n=1000 test: noise floor 0.131 driven by 
+small region cells (latam n=95, CI width 0.23). Raising 
+n-customers to 8000 tightens cells and makes acquisition_channel 
+conclusive. Wilson intervals used — correct for small cells 
+far from 0.5 where normal approximation fails.
+
+Implementation: segments reindexed onto X_test.index explicitly —
+silent row shift would produce confident fictional findings.

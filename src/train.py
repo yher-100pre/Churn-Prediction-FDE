@@ -92,13 +92,18 @@ import shap
 import xgboost as xgb
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
+    accuracy_score,
     average_precision_score,
     brier_score_loss,
     confusion_matrix,
+    fbeta_score,
     precision_recall_curve,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 # CUTOFF / AS_OF / NO_SESSION_RECENCY are the temporal and encoding contract, and
@@ -266,3 +271,283 @@ def load_and_split(
               f"accuracy floor={max(churn_rate, 1 - churn_rate):.3f}")
 
     return X_train, X_test, y_train, y_test, X_lr_train, X_lr_test, df_ood
+
+
+def _metric_block(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_score: np.ndarray | None = None,
+    is_probability: bool = False,
+) -> dict:
+    """Score one model into a flat, JSON-serialisable dict.
+
+    Every value is cast to a native Python type: numpy scalars survive in-memory
+    comparison but json.dump refuses them, and discovering that at artifact-write
+    time means re-running training.
+
+    y_score is any continuous ranking score, not necessarily a probability --
+    higher must mean more likely to churn. Passing it adds the threshold-free
+    metrics; omit it for a model that emits no ranking (the trivial baseline),
+    where ROC-AUC would be undefined rather than 0.5.
+    """
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    block = {
+        "n": int(len(y_true)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f2": float(fbeta_score(y_true, y_pred, beta=2, zero_division=0)),
+        "selection_rate": float(np.mean(y_pred)),
+        "confusion": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+        "roc_auc": None,
+        "pr_auc_churn": None,
+        "pr_auc_retention": None,
+        "brier": None,
+    }
+
+    if y_score is not None:
+        block["roc_auc"] = float(roc_auc_score(y_true, y_score))
+        block["pr_auc_churn"] = float(average_precision_score(y_true, y_score))
+        # Retention is the minority class and the harder call (see module
+        # docstring). Negating the score flips the ranking for any monotone
+        # score, so this works for the recency rule as well as for probabilities.
+        block["pr_auc_retention"] = float(average_precision_score(1 - y_true, -y_score))
+        if is_probability:
+            block["brier"] = float(brier_score_loss(y_true, y_score))
+
+    return block
+
+
+def _select_top_k(scores: np.ndarray, rate: float) -> tuple[np.ndarray, float, int]:
+    """Flag the top `rate` fraction of customers by score. Returns (pred, threshold, k).
+
+    Selection is by RANK, not by comparing against a probability cut-off, so the
+    audience size is exactly the campaign budget regardless of how the scores
+    happen to be distributed or calibrated. The implied probability threshold is
+    returned alongside for the service to apply.
+
+    Caveat worth knowing: when scores tie exactly at the boundary, rank selection
+    splits tied customers arbitrarily while a probability cut-off would take all
+    of them and overshoot the budget. Ties are vanishingly rare with continuous
+    scores, but the two rules are not identical and the service uses the
+    threshold, so its realised selection rate can drift slightly from the budget.
+    """
+    n = len(scores)
+    k = int(round(rate * n))
+    # Stable sort so ties break by original order rather than unpredictably --
+    # the same input must always produce the same audience.
+    order = np.argsort(-scores, kind="stable")
+    pred = np.zeros(n, dtype=int)
+    pred[order[:k]] = 1
+    threshold = float(scores[order[k - 1]]) if k > 0 else float("inf")
+    return pred, threshold, k
+
+
+def train_baselines(
+    X_train: pd.DataFrame,
+    X_lr_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    X_lr_test: pd.DataFrame,
+    y_test: pd.Series,
+) -> tuple[dict, Pipeline]:
+    """Fit and evaluate the three baselines XGBoost has to beat.
+
+    Returns (results, lr_pipeline): a dict shaped for direct consumption by
+    metrics.json, and the fitted scaler+LR pipeline for persisting as a baseline
+    artifact. The pipeline is returned as one object rather than a loose scaler
+    and model, because the two must never be applied separately at scoring time.
+
+    The three form a ladder of increasing sophistication, and each answers a
+    different question about whether the eventual model is worth deploying:
+
+        trivial       what does predicting nothing get you? This is the accuracy
+                      floor, and on a 64%-churn dataset it is embarrassingly high.
+        recency rule  what does the single strongest signal get you, with no model
+                      at all? A rule a stakeholder can hold in their head, and the
+                      thing that actually has to be beaten to justify an ML system.
+        logistic reg  what does a competent linear model get you? If XGBoost only
+                      matches this, ship this instead -- it is simpler to serve,
+                      explain, and monitor.
+
+    All three are evaluated on the same test split. The rule baseline's threshold
+    is chosen on TRAIN and then frozen, and the LR pipeline is fitted on TRAIN
+    only, so neither sees the test set before it is scored.
+
+    Comparability note: the rule and LR are both held to TARGET_SELECTION_RATE, so
+    their recall, precision and F2 are directly comparable. The trivial baseline
+    contacts everyone by definition and is NOT budget-feasible -- it is reported
+    as a floor reference, not as a deployable option, and its recall of 1.0 should
+    be read against that.
+    """
+    y_train_np = y_train.to_numpy()
+    y_test_np = y_test.to_numpy()
+    floor = float(max(y_test_np.mean(), 1 - y_test_np.mean()))
+
+    # Contacting TARGET_SELECTION_RATE of a base that is churn_rate churned can
+    # reach at most rate/churn_rate of the churners, even with a perfect ranker.
+    # Every recall figure below has to be read against this ceiling, or a model
+    # operating near-optimally looks like it is failing badly.
+    churn_rate = float(y_test_np.mean())
+    max_achievable_recall = float(min(1.0, TARGET_SELECTION_RATE / churn_rate)) if churn_rate else 0.0
+
+    results: dict = {
+        "test_n": int(len(y_test_np)),
+        "test_churn_rate": churn_rate,
+        "majority_class_accuracy_floor": floor,
+        "selection_rate_policy": TARGET_SELECTION_RATE,
+        "max_achievable_recall": max_achievable_recall,
+        "baselines": {},
+    }
+
+    print("\n" + "=" * 78)
+    print("BASELINES")
+    print("=" * 78)
+
+    # --- Baseline 1: trivial -------------------------------------------------
+    # Predict churn for everyone. Recall is 1.0 by construction and precision is
+    # just the base rate, which is exactly why F2 -- which weights recall 4x --
+    # flatters this model badly. That is the point: it shows that no single
+    # metric survives contact with a degenerate classifier, and that the metrics
+    # only mean something read together.
+    pred_trivial = np.ones(len(y_test_np), dtype=int)
+    results["baselines"]["trivial_always_churn"] = {
+        "description": "Predict churn for every customer (majority class).",
+        "threshold": 1.0,
+        **_metric_block(y_test_np, pred_trivial),
+    }
+    print("\n[1] Trivial -- always predict churn  (selection rate 1.00: NOT budget-feasible)")
+    _print_metrics(results["baselines"]["trivial_always_churn"], floor)
+
+    # --- Baseline 2: recency rule --------------------------------------------
+    # Chosen on TRAIN only, then frozen. Choosing on test would pick the threshold
+    # that happens to suit the test set and report the result as if it were held
+    # out -- the same self-grading error the CUTOFF split exists to prevent.
+    #
+    # The threshold is the one whose TRAIN selection rate lands closest to the
+    # campaign budget, NOT the one maximising F2. Maximising F2 here degenerates:
+    # F2 weights recall 4x, and with churn as the majority class no threshold ever
+    # beats predicting all-positive, so the sweep returns 0 and this baseline
+    # collapses into the trivial one. Matching the budget instead keeps the rule
+    # comparable with LR and XGBoost, which are held to the same audience size --
+    # recall and precision mean nothing when compared across different audience
+    # sizes.
+    recency_train = X_train["recency_days"].to_numpy()
+    recency_test = X_test["recency_days"].to_numpy()
+
+    candidates = np.arange(0, 401, dtype=float)
+    train_selection = np.array([float((recency_train > t).mean()) for t in candidates])
+    best_index = int(np.argmin(np.abs(train_selection - TARGET_SELECTION_RATE)))
+    best_threshold = float(candidates[best_index])
+    train_selection_rate = float(train_selection[best_index])
+
+    pred_rule = (recency_test > best_threshold).astype(int)
+    results["baselines"]["recency_rule"] = {
+        "description": f"Predict churn when recency_days > {best_threshold:.0f} days.",
+        "threshold": best_threshold,
+        "threshold_policy": f"train selection rate closest to {TARGET_SELECTION_RATE:.0%}",
+        "train_selection_rate": train_selection_rate,
+        # recency_days doubles as the ranking score: more days silent, more risk.
+        # NO_SESSION_RECENCY (999) sits above every candidate threshold, so
+        # never-seen customers are always flagged -- the intended behaviour.
+        **_metric_block(y_test_np, pred_rule, y_score=recency_test),
+    }
+    print(f"\n[2] Recency rule -- churn when recency_days > {best_threshold:.0f} days "
+          f"(chosen on train, train selection rate {train_selection_rate:.3f})")
+    _print_metrics(results["baselines"]["recency_rule"], floor, max_achievable_recall)
+
+    # --- Baseline 3: logistic regression -------------------------------------
+    # Scaling is required, not cosmetic: recency spans 0-365 while push_open_rate
+    # spans 0-1, and an unscaled fit would let the large-magnitude column dominate
+    # the L2 penalty and distort every coefficient.
+    #
+    # class_weight="balanced" downweights churn here, since churn is the MAJORITY
+    # class -- the opposite of the usual effect. That distorts LR's predicted
+    # probabilities, but the top-K rule below reads only their ORDER, and
+    # reweighting a linear model mostly shifts the intercept. Harmless for
+    # selection; it would matter if these probabilities were reported as
+    # calibrated risk, which they are not.
+    # Scaler and model are bound into one Pipeline so they can only ever be
+    # applied together. A loose scaler is the classic serving bug: the model
+    # loads, scores, and returns confident nonsense when the transform is
+    # forgotten or applied in the wrong order.
+    lr_pipeline = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("model", LogisticRegression(class_weight="balanced", max_iter=1000, random_state=RANDOM_SEED)),
+        ]
+    )
+    # Fitted on the DataFrame rather than an array so feature names are recorded
+    # on the pipeline, letting it detect column drift at scoring time.
+    lr_pipeline.fit(X_lr_train, y_train_np)
+    scores_lr = lr_pipeline.predict_proba(X_lr_test)[:, 1]
+
+    pred_lr, lr_threshold, k = _select_top_k(scores_lr, TARGET_SELECTION_RATE)
+    results["baselines"]["logistic_regression"] = {
+        "description": (
+            f"L2 logistic regression on {len(X_lr_train.columns)} features "
+            f"(scaled, class_weight=balanced); audience = top "
+            f"{TARGET_SELECTION_RATE:.0%} by score."
+        ),
+        "threshold": lr_threshold,
+        "threshold_policy": f"top-{TARGET_SELECTION_RATE:.0%} selection rate",
+        "n_selected": int(k),
+        "coefficients": {
+            col: float(coef)
+            for col, coef in zip(X_lr_train.columns, lr_pipeline.named_steps["model"].coef_[0])
+        },
+        **_metric_block(y_test_np, pred_lr, y_score=scores_lr, is_probability=True),
+    }
+    print(f"\n[3] Logistic regression -- audience = top {TARGET_SELECTION_RATE:.0%} "
+          f"({k} of {len(y_test_np)}), implied p >= {lr_threshold:.4f}")
+    _print_metrics(results["baselines"]["logistic_regression"], floor, max_achievable_recall)
+
+    _print_comparison(results, floor, max_achievable_recall)
+    return results, lr_pipeline
+
+
+def _print_metrics(block: dict, floor: float, max_recall: float | None = None) -> None:
+    """Print one metric block, always showing accuracy against the majority floor."""
+    delta = block["accuracy"] - floor
+    print(f"    accuracy   {block['accuracy']:.4f}   (floor {floor:.4f}, {delta:+.4f})")
+    # Recall is quoted as a share of what the budget makes reachable at all; the
+    # raw figure alone reads as failure for a model operating near-optimally.
+    if max_recall:
+        pct = f"  [{block['recall'] / max_recall:.0%} of max {max_recall:.4f}]"
+    else:
+        pct = ""
+    print(f"    recall     {block['recall']:.4f}{pct}")
+    print(f"    precision  {block['precision']:.4f}      F2 {block['f2']:.4f}")
+    if block["roc_auc"] is not None:
+        brier = f"   brier {block['brier']:.4f}" if block["brier"] is not None else ""
+        print(f"    ROC-AUC    {block['roc_auc']:.4f}      PR-AUC churn {block['pr_auc_churn']:.4f}"
+              f"      PR-AUC retention {block['pr_auc_retention']:.4f}{brier}")
+    else:
+        print("    ROC-AUC    n/a  (constant score -- no ranking to evaluate)")
+    c = block["confusion"]
+    print(f"    confusion  TN {c['tn']:<5} FP {c['fp']:<5} FN {c['fn']:<5} TP {c['tp']:<5}"
+          f"  selection rate {block['selection_rate']:.3f}")
+
+
+def _print_comparison(results: dict, floor: float, max_recall: float) -> None:
+    """Side-by-side table, ordered as the ladder the eventual model must climb."""
+    print("\n" + "-" * 92)
+    print(f"Recall (max achievable at {TARGET_SELECTION_RATE:.0%} budget: {max_recall:.3f})")
+    print("-" * 92)
+    print(f"{'model':<24} {'sel':>6} {'acc':>7} {'recall':>8} {'%max':>6} {'prec':>7} "
+          f"{'F2':>7} {'ROC-AUC':>8} {'PR-ret':>8} {'FN':>6}")
+    print("-" * 92)
+    for name, block in results["baselines"].items():
+        roc = f"{block['roc_auc']:.4f}" if block["roc_auc"] is not None else "n/a"
+        prr = f"{block['pr_auc_retention']:.4f}" if block["pr_auc_retention"] is not None else "n/a"
+        pct = f"{block['recall'] / max_recall:.0%}" if max_recall else "n/a"
+        print(f"{name:<24} {block['selection_rate']:>6.3f} {block['accuracy']:>7.4f} "
+              f"{block['recall']:>8.4f} {pct:>6} {block['precision']:>7.4f} {block['f2']:>7.4f} "
+              f"{roc:>8} {prr:>8} {block['confusion']['fn']:>6}")
+    print("-" * 92)
+    print(f"{'majority-class floor':<24} {'1.000':>6} {floor:>7.4f}"
+          f"   <- accuracy below this is worse than guessing")
+    print(f"\nRows at sel={TARGET_SELECTION_RATE:.2f} are directly comparable. The trivial baseline "
+          f"contacts everyone\n(sel=1.00) and is not budget-feasible -- its recall of 1.0 is free, "
+          f"and it is shown only\nas the accuracy floor. %max is recall as a share of what "
+          f"{TARGET_SELECTION_RATE:.0%} coverage can reach.")

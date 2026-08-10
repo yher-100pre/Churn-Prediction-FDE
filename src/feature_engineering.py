@@ -144,7 +144,7 @@ def build_features(events: list[dict]) -> pd.DataFrame:
 
         # PUSH RESPONSIVENESS: ignoring notifications shows the app has lost
         # mindshare -- reachability decays before usage does.
-        push_open_rate = push_open_count / push_sent_count if push_sent_count else 0.0
+        push_open_rate = min(push_open_count / push_sent_count, 1.0) if push_sent_count > 0 else 0.0
 
         # CAMPAIGN RESPONSIVENESS: clicking through to content is stronger
         # intent than merely opening a push; near-zero means marketing can no

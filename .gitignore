@@ -24,3 +24,5 @@ data/rfm_features.csv
 __pycache__/
 *.pyc
 .venv/
+aws/
+awscliv2.zip

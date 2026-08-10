@@ -237,6 +237,16 @@ SEGMENT_CHURN_TARGETS = {
     },
 }
 
+# How hard the segment target pulls the engagement draw. 0.0 = segments are pure
+# decoration and the model can learn nothing from them; 1.0 = engagement is a
+# deterministic function of segment, so the model would just memorise the tier
+# and the fairness check would be measuring our own fabrication. 0.4 leaves the
+# Beta draw dominant (60% of the weight) while still producing a segment signal
+# strong enough to be learnable -- and, importantly, leaves the segments
+# overlapping, so an engaged free-tier customer and a disengaged premium one both
+# exist in the data.
+SEGMENT_SHIFT_ALPHA = 0.4
+
 # --- Output paths ------------------------------------------------------------
 DEFAULT_EVENTS_OUT = "data/synthetic_events.json"
 DEFAULT_CUSTOMERS_OUT = "data/synthetic_customers.json"
@@ -244,3 +254,58 @@ DEFAULT_CUSTOMERS_OUT = "data/synthetic_customers.json"
 # Synthetic ids continue past the raw sample's cust_00000..cust_00079 so the two
 # sets can be concatenated without collision.
 CUSTOMER_ID_OFFSET = 1000
+
+
+def _weighted_choice(rng: random.Random, distribution: list[tuple[str, float]]) -> str:
+    """Draw one value from a [(value, weight), ...] distribution."""
+    values = [value for value, _ in distribution]
+    weights = [weight for _, weight in distribution]
+    return rng.choices(values, weights=weights, k=1)[0]
+
+
+def sample_customer(rng: random.Random, customer_id: str) -> dict:
+    """Draw one synthetic customer: segment attributes plus a latent engagement level.
+
+    Segments are drawn first, then used to tilt the engagement draw. The order
+    matters: engagement is the single hidden cause of every event this customer
+    will emit (see module docstring), so the segment influence has to be baked in
+    here -- before any behaviour exists -- rather than applied to the label later.
+    That is what makes the target churn rates emerge from behaviour instead of
+    being stamped on.
+
+    The tilt is a weighted blend toward the segment's implied retention:
+
+        engagement = (1 - ALPHA) * beta_draw + ALPHA * (1 - churn_target)
+
+    Beta(2,2) is the population prior -- symmetric, centred at 0.5, with thin
+    tails so extreme customers are rare. Blending shifts and narrows it, so the
+    per-segment realised distribution is a tilted Beta, not Beta(2,2) itself.
+    """
+    plan_tier = _weighted_choice(rng, SEGMENT_DISTRIBUTIONS["plan_tier"])
+    acquisition_channel = _weighted_choice(rng, SEGMENT_DISTRIBUTIONS["acquisition_channel"])
+    # Drawn like any other segment, but deliberately not consulted below: region
+    # carries no churn modifier, so it stays a pure control for the fairness
+    # audit (see module docstring).
+    region = _weighted_choice(rng, SEGMENT_DISTRIBUTIONS["region"])
+
+    # Simple average of the two contributing segment targets. Both marginals
+    # independently imply ~0.65 population churn, so averaging them does not drag
+    # the aggregate off target.
+    churn_target = (
+        SEGMENT_CHURN_TARGETS["plan_tier"][plan_tier]
+        + SEGMENT_CHURN_TARGETS["acquisition_channel"][acquisition_channel]
+    ) / 2.0
+
+    beta_draw = rng.betavariate(2.0, 2.0)
+    engagement_level = (1.0 - SEGMENT_SHIFT_ALPHA) * beta_draw + SEGMENT_SHIFT_ALPHA * (1.0 - churn_target)
+
+    return {
+        "customer_id": customer_id,
+        "plan_tier": plan_tier,
+        "acquisition_channel": acquisition_channel,
+        "region": region,
+        "engagement_level": engagement_level,
+        # Flags every row as invented, so nothing downstream can mistake these
+        # segments for observed data if the synthetic and raw sets are merged.
+        "is_synthetic": True,
+    }

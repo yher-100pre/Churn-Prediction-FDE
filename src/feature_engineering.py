@@ -41,8 +41,11 @@ Label   = zero sessions in [CUTOFF, AS_OF]  ->  churned (1), else retained (0).
 
 from __future__ import annotations
 
+import argparse
+import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -180,3 +183,43 @@ def build_features(events: list[dict]) -> pd.DataFrame:
     print(f"Feature means: {df.describe().loc['mean'].round(2).to_dict()}")
 
     return df
+
+
+def main() -> None:
+    """CLI: raw event JSON -> per-customer RFM table on disk (parquet + csv)."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--input",
+        default="data/events.json",
+        help="Raw event stream JSON (raw sample or synthetic). Default: data/events.json",
+    )
+    parser.add_argument(
+        "--output",
+        default="data/rfm_features.parquet",
+        help="Parquet output path; the .csv twin is derived from it. Default: data/rfm_features.parquet",
+    )
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    with input_path.open() as fh:
+        events = json.load(fh)
+    print(f"Loaded {len(events)} events from {input_path}")
+
+    df = build_features(events)
+
+    parquet_path = Path(args.output)
+    csv_path = parquet_path.with_suffix(".csv")
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # pyarrow explicitly: Athena/Glue read the parquet straight out of S3, so the
+    # writer must be the one whose type mapping they expect (not fastparquet).
+    df.to_parquet(parquet_path, engine="pyarrow", index=False)
+    # CSV twin for eyeballing and quick diffs; parquet stays the canonical artifact.
+    df.to_csv(csv_path, index=False)
+
+    print(f"Wrote parquet: {parquet_path}")
+    print(f"Wrote csv:     {csv_path}")
+
+
+if __name__ == "__main__":
+    main()

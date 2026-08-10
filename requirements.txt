@@ -19,6 +19,7 @@ nvidia-nccl-cu13==2.30.7
 packaging==26.3
 pandas==3.0.5
 pluggy==1.6.0
+pyarrow==25.0.0
 pydantic==2.13.4
 pydantic_core==2.46.4
 Pygments==2.20.0

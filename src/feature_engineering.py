@@ -67,18 +67,41 @@ WINDOW_30D = CUTOFF - timedelta(days=30)  # 2024-04-01T12:00:00Z
 # instead of treating "never seen" as "seen a long time ago".
 NO_SESSION_RECENCY = 999.0
 
+# --- Customer sidecar merge --------------------------------------------------
+# Columns build_features will accept from the optional customer sidecar. This is
+# a WHITELIST, deliberately, rather than "merge whatever the sidecar has".
+#
+# The synthetic sidecar also carries `engagement_level`, the latent scalar that
+# generates every event and therefore the label itself. Merging it in would hand
+# the model the answer -- a leak far worse than the temporal one this module is
+# built to prevent, and one that would not show up as anything except suspiciously
+# good metrics. Segment columns are fairness-audit dimensions and legitimate
+# features; the latent cause is neither. Adding a new segment means adding it
+# here explicitly, which is the point: the default is exclusion.
+SEGMENT_COLUMNS = ("plan_tier", "acquisition_channel", "region", "is_synthetic")
+
 
 def parse_ts(ts_str: str) -> datetime:
     """Parse an ISO-8601 timestamp (trailing 'Z' allowed) to a UTC-aware datetime."""
     return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
-def build_features(events: list[dict]) -> pd.DataFrame:
+def build_features(events: list[dict], customers: list[dict] | None = None) -> pd.DataFrame:
     """Collapse a raw event stream into a per-customer RFM + engagement table.
 
     One row per customer_id. The label comes only from the label window
     [CUTOFF, AS_OF); every feature comes only from events strictly before
     CUTOFF, so no post-CUTOFF signal can reach the model (see module docstring).
+
+    `customers` is an optional sidecar of customer-attribute dicts (as emitted by
+    generate_synthetic), each with a `customer_id` plus segment fields. When
+    supplied, the columns named in SEGMENT_COLUMNS are joined on as a final step,
+    giving the fairness audit something to slice on. Only those columns cross the
+    join -- see SEGMENT_COLUMNS for why that whitelist is not negotiable.
+
+    Passing None leaves the raw-sample path exactly as it was: the raw events have
+    no profile fields, so there is no sidecar to merge and the output is
+    features-plus-label only.
     """
     # Group first so each customer's timeline can be bucketed independently.
     by_customer: dict[str, list[dict]] = defaultdict(list)
@@ -177,6 +200,23 @@ def build_features(events: list[dict]) -> pd.DataFrame:
     if df.empty:
         print("build_features: no events supplied -- empty feature table.")
         return df
+
+    if customers:
+        segments = pd.DataFrame(customers)
+        # Intersect rather than index directly: a sidecar missing an optional
+        # column should not take the whole build down, and any column NOT in the
+        # whitelist (engagement_level above all) is dropped here.
+        keep = ["customer_id"] + [c for c in SEGMENT_COLUMNS if c in segments.columns]
+        # Left join: the event stream decides who is in the table. A customer in
+        # the sidecar with no events has no features and must not appear as a row
+        # of nulls; one with events but no sidecar entry keeps its features and
+        # gets null segments, which the fairness slice can then exclude explicitly
+        # rather than silently.
+        df = df.merge(segments[keep].drop_duplicates("customer_id"), on="customer_id", how="left")
+
+        missing = int(df[keep[1]].isna().sum()) if len(keep) > 1 else 0
+        if missing:
+            print(f"build_features: {missing} customers had events but no sidecar entry -- segments are null.")
 
     print(f"Customers: {len(df)}")
     print(f"Churn rate: {df['churned'].mean() * 100:.1f}%")

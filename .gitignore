@@ -11,6 +11,7 @@ venv/
 
 # Data outputs
 data/synthetic_events.json
+data/synthetic_customers.json
 data/training_features.parquet
 data/training_features.csv
 data/rfm_features.parquet

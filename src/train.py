@@ -86,10 +86,17 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+import matplotlib
 import numpy as np
 import pandas as pd
 import shap
 import xgboost as xgb
+
+# Must precede the pyplot import. Training runs headless -- WSL, containers, CI --
+# and the default interactive backend fails at savefig time rather than at import,
+# which turns a missing display into a late crash after the model is already fitted.
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402  (backend must be set first)
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -502,7 +509,7 @@ def train_baselines(
           f"({k} of {len(y_test_np)}), implied p >= {lr_threshold:.4f}")
     _print_metrics(results["baselines"]["logistic_regression"], floor, max_achievable_recall)
 
-    _print_comparison(results, floor, max_achievable_recall)
+    _print_comparison(results["baselines"], floor, max_achievable_recall)
     return results, lr_pipeline
 
 
@@ -529,7 +536,7 @@ def _print_metrics(block: dict, floor: float, max_recall: float | None = None) -
           f"  selection rate {block['selection_rate']:.3f}")
 
 
-def _print_comparison(results: dict, floor: float, max_recall: float) -> None:
+def _print_comparison(blocks: dict, floor: float, max_recall: float) -> None:
     """Side-by-side table, ordered as the ladder the eventual model must climb."""
     print("\n" + "-" * 92)
     print(f"Recall (max achievable at {TARGET_SELECTION_RATE:.0%} budget: {max_recall:.3f})")
@@ -537,7 +544,7 @@ def _print_comparison(results: dict, floor: float, max_recall: float) -> None:
     print(f"{'model':<24} {'sel':>6} {'acc':>7} {'recall':>8} {'%max':>6} {'prec':>7} "
           f"{'F2':>7} {'ROC-AUC':>8} {'PR-ret':>8} {'FN':>6}")
     print("-" * 92)
-    for name, block in results["baselines"].items():
+    for name, block in blocks.items():
         roc = f"{block['roc_auc']:.4f}" if block["roc_auc"] is not None else "n/a"
         prr = f"{block['pr_auc_retention']:.4f}" if block["pr_auc_retention"] is not None else "n/a"
         pct = f"{block['recall'] / max_recall:.0%}" if max_recall else "n/a"
@@ -551,3 +558,447 @@ def _print_comparison(results: dict, floor: float, max_recall: float) -> None:
           f"contacts everyone\n(sel=1.00) and is not budget-feasible -- its recall of 1.0 is free, "
           f"and it is shown only\nas the accuracy floor. %max is recall as a share of what "
           f"{TARGET_SELECTION_RATE:.0%} coverage can reach.")
+
+
+def _threshold_at_selection_rate(scores: np.ndarray, rate: float) -> tuple[float, float]:
+    """Score cut-off that selects `rate` of the population. Returns (threshold, realised rate).
+
+    Used to freeze an operating threshold on TRAIN scores. Unlike _select_top_k,
+    which takes exactly k rows and is therefore only definable on the set it is
+    applied to, this returns a fixed number the service can apply to any incoming
+    batch -- which is what a deployed threshold has to be.
+
+    The realised rate is returned because ties mean the cut-off will not land on
+    the target exactly, and because the caller should report what the threshold
+    actually did rather than assume it hit the budget.
+    """
+    threshold = float(np.quantile(scores, 1.0 - rate))
+    realised = float(np.mean(scores >= threshold))
+    return threshold, realised
+
+
+def train_xgboost(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    seed: int = RANDOM_SEED,
+    baseline_results: dict | None = None,
+) -> tuple[xgb.XGBClassifier, float, dict]:
+    """Fit the candidate model, freeze its operating threshold, and evaluate it.
+
+    Returns (model, threshold, metrics).
+
+    baseline_results is the dict from train_baselines. It is optional only so this
+    function can be run standalone; pass it to get the four-model comparison table
+    and the "what does XGBoost buy" verdict, which is the question this section
+    exists to answer.
+
+    Hyperparameters, and why each:
+
+        n_estimators=300 + learning_rate=0.05
+            Many shallow steps rather than few large ones. A low learning rate
+            with more rounds is the standard variance-reduction trade for tabular
+            data: each tree corrects a little, so no single split dominates.
+        max_depth=4
+            Deliberately shallow. Nine features on 4000 rows overfits fast at
+            depth 6+, and depth 4 still captures the interactions that matter
+            (recency x frequency). It also keeps SHAP attributions readable,
+            which is a deliverable here, not a nicety.
+        subsample=0.8, colsample_bytree=0.8
+            Each tree sees 80% of rows and 80% of columns, decorrelating the
+            ensemble so it cannot lean entirely on recency -- the feature that
+            already carries most of the signal.
+        scale_pos_weight=1.0
+            Set EXPLICITLY, because the default reflex is wrong here. Churn is the
+            MAJORITY class (~64%), so the usual neg/pos upweighting would push an
+            already-dominant class harder, distorting the predicted probabilities
+            that the threshold policy and the Brier score both read. 1.0 leaves
+            them undistorted. See the module docstring.
+        eval_metric="logloss", early_stopping_rounds=20
+            Stop once held-out logloss stops improving for 20 rounds, so the
+            300-tree budget is a ceiling rather than a target.
+
+    Early stopping runs against a validation split carved out of TRAIN, never
+    against the test set. Stopping on test would choose the tree count using the
+    same rows the metrics are then reported on -- self-grading, and the same error
+    the CUTOFF boundary and the rule baseline's train-only sweep exist to prevent.
+    The test set is untouched until final evaluation.
+    """
+    y_train_np = y_train.to_numpy()
+    y_test_np = y_test.to_numpy()
+    floor = float(max(y_test_np.mean(), 1 - y_test_np.mean()))
+    churn_rate = float(y_test_np.mean())
+    max_achievable_recall = float(min(1.0, TARGET_SELECTION_RATE / churn_rate)) if churn_rate else 0.0
+
+    print("\n" + "=" * 78)
+    print("XGBOOST")
+    print("=" * 78)
+
+    # Carve the early-stopping validation set out of TRAIN. The model is fitted on
+    # X_fit only; X_val decides when to stop. Test is not referenced until the
+    # evaluation block below.
+    X_fit, X_val, y_fit, y_val = train_test_split(
+        X_train, y_train, test_size=0.20, random_state=seed, stratify=y_train
+    )
+    print(f"Fit on {len(X_fit)} rows, early stopping on {len(X_val)} held out of train "
+          f"(test set untouched: {len(X_test)} rows)")
+
+    model = xgb.XGBClassifier(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        # Churn is the majority class here -- see docstring above. Do not "fix"
+        # this to neg/pos without re-reading that paragraph.
+        scale_pos_weight=1.0,
+        eval_metric="logloss",
+        early_stopping_rounds=20,
+        random_state=seed,
+        n_jobs=-1,
+    )
+    model.fit(X_fit, y_fit.to_numpy(), eval_set=[(X_val, y_val.to_numpy())], verbose=False)
+
+    best_iteration = int(getattr(model, "best_iteration", model.n_estimators - 1))
+    print(f"Trained: best_iteration={best_iteration} of {model.n_estimators} "
+          f"(early stopping after 20 rounds without improvement on val)")
+
+    # --- Freeze the operating threshold --------------------------------------
+    # Derived on the VALIDATION split, then applied unchanged to test, so the test
+    # selection rate is an OUTCOME we observe rather than a constraint we impose.
+    #
+    # Val rather than the full train set: the model was fitted on X_fit, so its
+    # scores there are optimistically extreme, and a quantile taken from them
+    # misplaces the cut-off. Val was only used for the stopping decision, so its
+    # score distribution is a near-unbiased stand-in for unseen data -- which is
+    # what a threshold has to generalise to. Deriving it from test would fit the
+    # threshold to the data it is scored on and manufacture a 30% selection rate
+    # that production could never reproduce.
+    val_scores = model.predict_proba(X_val)[:, 1]
+    threshold, train_selection = _threshold_at_selection_rate(val_scores, TARGET_SELECTION_RATE)
+
+    test_scores = model.predict_proba(X_test)[:, 1]
+    pred = (test_scores >= threshold).astype(int)
+
+    print(f"Threshold frozen on val: p >= {threshold:.4f} "
+          f"(val selection rate {train_selection:.3f}) -> test selection rate {pred.mean():.3f}")
+
+    block = {
+        "description": (
+            f"XGBoost ({best_iteration + 1} trees, depth 4, lr 0.05); "
+            f"threshold frozen on validation at {TARGET_SELECTION_RATE:.0%} selection."
+        ),
+        "threshold": threshold,
+        "threshold_policy": f"validation selection rate closest to {TARGET_SELECTION_RATE:.0%}, frozen",
+        "val_selection_rate": train_selection,
+        "n_fit": int(len(X_fit)),
+        "n_val": int(len(X_val)),
+        "best_iteration": best_iteration,
+        "n_estimators_budget": int(model.n_estimators),
+        "max_achievable_recall": max_achievable_recall,
+        **_metric_block(y_test_np, pred, y_score=test_scores, is_probability=True),
+    }
+    block["pct_max_recall"] = float(block["recall"] / max_achievable_recall) if max_achievable_recall else None
+
+    _print_metrics(block, floor, max_achievable_recall)
+
+    metrics = {
+        "test_n": int(len(y_test_np)),
+        "test_churn_rate": churn_rate,
+        "majority_class_accuracy_floor": floor,
+        "selection_rate_policy": TARGET_SELECTION_RATE,
+        "max_achievable_recall": max_achievable_recall,
+        "xgboost": block,
+    }
+
+    # --- Four-model comparison ----------------------------------------------
+    if baseline_results:
+        combined = {**baseline_results["baselines"], "xgboost": block}
+        _print_comparison(combined, floor, max_achievable_recall)
+        matched = _print_verdict(
+            block, baseline_results["baselines"], test_scores, X_test["recency_days"].to_numpy(), y_test_np
+        )
+        block["matched_audience_comparison"] = matched
+
+    return model, threshold, metrics
+
+
+def _matched_audience(scores: np.ndarray, y_true: np.ndarray, rate: float) -> dict:
+    """Score a ranking at an exactly-matched audience size, so models are comparable.
+
+    Frozen thresholds land each model on a slightly different realised selection
+    rate, and false-negative counts are not comparable across different audience
+    sizes: contacting more people finds more churners for free. This re-selects
+    every model's top `rate` fraction by rank so the only thing that differs is
+    the quality of the ordering.
+    """
+    n = len(scores)
+    k = int(round(rate * n))
+    order = np.argsort(-scores, kind="stable")
+    pred = np.zeros(n, dtype=int)
+    pred[order[:k]] = 1
+    return {
+        "selection_rate": float(pred.mean()),
+        "n_selected": int(k),
+        "recall": float(recall_score(y_true, pred, zero_division=0)),
+        "precision": float(precision_score(y_true, pred, zero_division=0)),
+        "false_negatives": int(((y_true == 1) & (pred == 0)).sum()),
+        "true_positives": int(((y_true == 1) & (pred == 1)).sum()),
+    }
+
+
+def _print_verdict(
+    xgb_block: dict,
+    baselines: dict,
+    xgb_scores: np.ndarray,
+    rule_scores: np.ndarray,
+    y_true: np.ndarray,
+) -> dict:
+    """State plainly what XGBoost buys over the rule -- the question Section 4 exists to answer.
+
+    Compared against the recency rule specifically, not against the trivial
+    baseline: the rule is the honest bar, because it is free to build, trivial to
+    explain, and needs no serving infrastructure at all. If the model cannot beat
+    a threshold on one column, the model is not worth the pipeline behind it.
+
+    Ranking metrics lead, because they are the only part of the comparison that
+    does not depend on how many customers each model happened to select. The
+    false-negative comparison follows, at an explicitly matched audience.
+    """
+    rule = baselines.get("recency_rule")
+    if not rule:
+        return {}
+
+    roc_delta = xgb_block["roc_auc"] - rule["roc_auc"]
+    pr_ret_delta = xgb_block["pr_auc_retention"] - rule["pr_auc_retention"]
+
+    xgb_matched = _matched_audience(xgb_scores, y_true, TARGET_SELECTION_RATE)
+    rule_matched = _matched_audience(rule_scores, y_true, TARGET_SELECTION_RATE)
+    found_delta = xgb_matched["true_positives"] - rule_matched["true_positives"]
+
+    print("\nVERDICT -- what XGBoost buys over the recency rule:")
+    print(f"  Ranking (independent of audience size): ROC-AUC {roc_delta:+.4f} "
+          f"({rule['roc_auc']:.4f} -> {xgb_block['roc_auc']:.4f}), "
+          f"PR-AUC-retention {pr_ret_delta:+.4f} "
+          f"({rule['pr_auc_retention']:.4f} -> {xgb_block['pr_auc_retention']:.4f}).")
+
+    verb = "more" if found_delta >= 0 else "fewer"
+    print(f"  At an equal {TARGET_SELECTION_RATE:.0%} budget ({xgb_matched['n_selected']} contacted): "
+          f"XGBoost finds {abs(found_delta)} {verb} churners than the rule "
+          f"({xgb_matched['true_positives']} vs {rule_matched['true_positives']} caught; "
+          f"FN {xgb_matched['false_negatives']} vs {rule_matched['false_negatives']}).")
+
+    if found_delta <= 0:
+        # Said plainly rather than buried: a model that does not beat the rule at
+        # the operating point is a finding, not a failure to report around.
+        print("  At this budget the better ranking does NOT convert into more churners caught. "
+              "It would\n  pay off at a different budget, or for tiering the audience -- not here.")
+
+    return {"xgboost": xgb_matched, "recency_rule": rule_matched, "churners_found_delta": int(found_delta)}
+
+
+# --- Explainability copy -----------------------------------------------------
+# One business sentence per feature, describing what a POSITIVE SHAP value means
+# -- i.e. what pushes this customer's churn score UP. Written for a product
+# stakeholder, not a modeller: no mention of SHAP, log-odds or features.
+#
+# `expected` is the direction we believe the business logic implies. It is not
+# used to constrain the model; it is checked against what the model actually
+# learned, so a sign flip surfaces as a finding rather than hiding inside a plot.
+FEATURE_INTERPRETATIONS = {
+    "recency_days": {
+        "expected": "positive",
+        "meaning": "The longer a customer has gone without opening the app, the higher their churn risk -- silence is the earliest and strongest warning.",
+    },
+    "freq_30d": {
+        "expected": "negative",
+        "meaning": "Opening the app repeatedly in the last month signals an intact habit, and habit is what keeps customers next month.",
+    },
+    "freq_90d": {
+        "expected": "negative",
+        "meaning": "A steady three-month visit history separates a genuine regular from someone who showed up once; regulars churn less.",
+    },
+    "monetary_90d": {
+        "expected": "negative",
+        "meaning": "Money already spent creates switching friction -- paying customers have something to lose by leaving.",
+    },
+    "purchase_count_90d": {
+        "expected": "negative",
+        "meaning": "Buying repeatedly matters more than buying big: a transacting habit shows ongoing intent, not a single impulse.",
+    },
+    "avg_session_duration": {
+        "expected": "negative",
+        "meaning": "Short visits mean shallow engagement; dwell time falling off is an early warning that arrives before outright silence.",
+    },
+    "push_open_rate": {
+        "expected": "negative",
+        "meaning": "Ignoring notifications shows the app has lost mindshare -- reachability decays before usage does.",
+    },
+    "campaign_click_rate": {
+        "expected": "negative",
+        "meaning": "Clicking through to content is stronger intent than merely opening a push; near-zero means marketing can no longer pull this customer back.",
+    },
+    "support_ticket_count": {
+        "expected": "positive",
+        "meaning": "Support tickets are logged dissatisfaction -- unresolved billing disputes and bugs are a leading cause of customers leaving voluntarily.",
+    },
+}
+
+
+def compute_shap(
+    model: xgb.XGBClassifier,
+    X_test: pd.DataFrame,
+    output_dir: str | Path,
+    threshold: float | None = None,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Explain the fitted model with SHAP and write the explainability artifacts.
+
+    Returns (shap_values, importance_df).
+
+    `threshold` is the frozen operating threshold, used to pick the boundary
+    customer -- the one sitting closest to the in/out line, whose explanation is
+    the one a stakeholder disputing an audience decision will actually ask about.
+    It defaults to the median score if not supplied, so the function can be run
+    standalone.
+
+    TreeExplainer is exact for gradient-boosted trees: it walks the tree structure
+    rather than sampling perturbations, so there is no approximation error and no
+    background dataset to choose. SHAP values are in LOG-ODDS, and they are
+    additive -- base value plus every feature contribution reconstructs the
+    model's raw output for that customer exactly. That additivity is what makes
+    the waterfall plots defensible in a stakeholder conversation: the numbers on
+    the chart sum to the score.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 78)
+    print("SHAP EXPLAINABILITY")
+    print("=" * 78)
+
+    explainer = shap.TreeExplainer(model)
+    explanation = explainer(X_test)
+    shap_values = explanation.values
+
+    scores = model.predict_proba(X_test)[:, 1]
+    if threshold is None:
+        threshold = float(np.median(scores))
+        print(f"No threshold supplied -- using median score {threshold:.4f} for the boundary case.")
+
+    # --- Global importance ---------------------------------------------------
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    # Sign of the value/attribution relationship: does a HIGH feature value push
+    # the score up or down? Computed from the model's own attributions rather
+    # than assumed, so the check below is meaningful.
+    directions = []
+    for j, col in enumerate(X_test.columns):
+        feature_values = X_test.iloc[:, j].to_numpy()
+        if np.std(feature_values) == 0 or np.std(shap_values[:, j]) == 0:
+            directions.append(np.nan)
+        else:
+            directions.append(float(np.corrcoef(feature_values, shap_values[:, j])[0, 1]))
+
+    importance_df = pd.DataFrame(
+        {
+            "feature": list(X_test.columns),
+            "mean_abs_shap": mean_abs,
+            "value_shap_corr": directions,
+        }
+    ).sort_values("mean_abs_shap", ascending=False, ignore_index=True)
+    importance_df["rank"] = importance_df.index + 1
+    importance_df["direction"] = np.where(
+        importance_df["value_shap_corr"].isna(), "flat",
+        np.where(importance_df["value_shap_corr"] > 0, "positive", "negative"),
+    )
+
+    # --- Plots ---------------------------------------------------------------
+    shap.plots.bar(explanation, max_display=SHAP_MAX_DISPLAY, show=False)
+    _save_plot(output_dir / "shap_importance.png")
+
+    shap.plots.beeswarm(explanation, max_display=SHAP_MAX_DISPLAY, show=False)
+    _save_plot(output_dir / "shap_beeswarm.png")
+
+    # --- Three individual explanations ---------------------------------------
+    # Highest and lowest are the easy cases -- useful for showing the model's
+    # reasoning at the extremes. The boundary case is the important one: it is
+    # the marginal customer the campaign either does or does not contact.
+    cases = {
+        "high": int(np.argmax(scores)),
+        "low": int(np.argmin(scores)),
+        "boundary": int(np.argmin(np.abs(scores - threshold))),
+    }
+
+    case_details = {}
+    for label, position in cases.items():
+        shap.plots.waterfall(explanation[position], max_display=SHAP_MAX_DISPLAY, show=False)
+        _save_plot(output_dir / f"shap_waterfall_{label}.png")
+        contributions = dict(zip(X_test.columns, shap_values[position]))
+        top_driver = max(contributions, key=lambda c: abs(contributions[c]))
+        case_details[label] = {
+            "row_position": position,
+            "customer_index": int(X_test.index[position]),
+            "churn_score": float(scores[position]),
+            "top_driver": top_driver,
+            "top_driver_shap": float(contributions[top_driver]),
+            "feature_values": {c: float(v) for c, v in X_test.iloc[position].items()},
+        }
+
+    # --- Interpretations -----------------------------------------------------
+    # Each entry pairs the business sentence with what the model actually did, so
+    # a reader can see where the two disagree instead of trusting the copy.
+    interpretations = {
+        "base_value_log_odds": float(np.mean(explanation.base_values)),
+        "units": "SHAP values are log-odds contributions; positive pushes churn risk up.",
+        "features": {},
+        "cases": case_details,
+    }
+    contradictions = []
+    for row in importance_df.itertuples():
+        spec = FEATURE_INTERPRETATIONS.get(row.feature, {})
+        expected = spec.get("expected")
+        matches = (expected == row.direction) if expected and row.direction != "flat" else None
+        if matches is False:
+            contradictions.append(row.feature)
+        interpretations["features"][row.feature] = {
+            "rank": int(row.rank),
+            "mean_abs_shap": float(row.mean_abs_shap),
+            "observed_direction": row.direction,
+            "expected_direction": expected,
+            "matches_expectation": matches,
+            "meaning": spec.get("meaning", "No interpretation recorded for this feature."),
+        }
+
+    interpretations["direction_contradictions"] = contradictions
+
+    with (output_dir / "shap_interpretations.json").open("w") as fh:
+        json.dump(interpretations, fh, indent=2)
+
+    # --- Report --------------------------------------------------------------
+    print(f"\nBase value (log-odds): {interpretations['base_value_log_odds']:+.4f}")
+    print("\nTop 3 drivers by mean |SHAP|:")
+    for row in importance_df.head(3).itertuples():
+        spec = FEATURE_INTERPRETATIONS.get(row.feature, {})
+        print(f"  {row.rank}. {row.feature:<22} mean|SHAP| = {row.mean_abs_shap:.4f}   "
+              f"({row.direction}: {'higher value -> more churn risk' if row.direction == 'positive' else 'higher value -> less churn risk'})")
+        print(f"     {spec.get('meaning', '')}")
+
+    if contradictions:
+        # Not buried in the JSON: a feature the model reads backwards from the
+        # business story is either a data problem or a story problem, and either
+        # way it must not reach a stakeholder deck unexamined.
+        print(f"\n  WARNING: {len(contradictions)} feature(s) contradict the expected direction: "
+              f"{', '.join(contradictions)}")
+        print("  Check these before presenting -- the model disagrees with the business rationale.")
+
+    print(f"\nWrote: shap_importance.png, shap_beeswarm.png, "
+          f"shap_waterfall_{{high,low,boundary}}.png, shap_interpretations.json -> {output_dir}")
+
+    return shap_values, importance_df
+
+
+def _save_plot(path: Path) -> None:
+    """Save the current figure and close it, so figures cannot accumulate."""
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close("all")

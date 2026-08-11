@@ -56,6 +56,7 @@ import uvicorn
 import xgboost as xgb
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -279,6 +280,22 @@ app = FastAPI(
     description="Scores mobile-marketing customers for churn risk from a 9-feature RFM vector.",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# Wide open so the dashboard can call the API from any origin during the
+# interview demo. Note for review: allow_origins=["*"] with
+# allow_credentials=True does not send a literal "*" -- Starlette echoes the
+# caller's Origin back and adds Allow-Credentials: true, so ANY site can make
+# credentialed cross-origin calls. Harmless while auth is a Bearer header (a
+# hostile page cannot read another origin's token), but it must not survive
+# into a deployment that authenticates with cookies. Production fix: pin
+# allow_origins to the dashboard URL, or drop allow_credentials.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

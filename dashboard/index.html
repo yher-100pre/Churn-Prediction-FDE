@@ -1,0 +1,811 @@
+<!--
+  DEMO ONLY: The JWT token hardcoded in this file is signed with
+  the development secret "dev-secret-do-not-use-in-prod".
+  It only works against a local server started with that same secret.
+  This is NOT a production credential and cannot access any real system.
+  Before any real deployment: replace with a proper auth flow and
+  pin CORS allow_origins to the dashboard URL in serve.py.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Churn Prediction Service — Localytics FDE</title>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://unpkg.com/chart.js@4/dist/chart.umd.js"></script>
+
+<style>
+  :root {
+    --primary: #7C3AED;
+    --primary-soft: rgba(124, 58, 237, 0.16);
+    --accent: #EC4899;
+    --bg: #0F172A;
+    --card: #1E293B;
+    --text: #F1F5F9;
+    --success: #10B981;
+    --danger: #EF4444;
+    --muted: #94A3B8;
+    --line: rgba(148, 163, 184, 0.16);
+    --radius: 16px;
+    --shadow: 0 10px 30px -12px rgba(0, 0, 0, 0.6), 0 2px 8px -2px rgba(0, 0, 0, 0.4);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 520px at 12% -8%, rgba(124, 58, 237, 0.20), transparent 60%),
+      radial-gradient(900px 460px at 92% 0%, rgba(236, 72, 153, 0.14), transparent 62%),
+      var(--bg);
+    background-attachment: fixed;
+    color: var(--text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+
+  .shell { max-width: 1420px; margin: 0 auto; padding: 28px 28px 64px; }
+
+  /* ---------- Header ---------- */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 24px; flex-wrap: wrap;
+    padding: 22px 26px; margin-bottom: 26px;
+    background: linear-gradient(135deg, rgba(30, 41, 59, 0.95), rgba(30, 41, 59, 0.75));
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(10px);
+  }
+  .brand { display: flex; align-items: center; gap: 16px; }
+  .brand-mark {
+    width: 48px; height: 48px; border-radius: 14px;
+    display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    box-shadow: 0 8px 20px -6px rgba(124, 58, 237, 0.7);
+  }
+  .brand-mark .material-icons { font-size: 26px; color: #fff; }
+  h1 { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.02em; }
+  .subtitle { margin: 3px 0 0; font-size: 13px; color: var(--muted); font-weight: 500; }
+
+  .status {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 16px; border-radius: 999px;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid var(--line);
+    font-size: 13px; font-weight: 600;
+    transition: border-color 0.3s ease, background 0.3s ease;
+  }
+  .status .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--muted); transition: background 0.3s ease;
+  }
+  .status.online { border-color: rgba(16, 185, 129, 0.4); }
+  .status.online .dot { background: var(--success); box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.18); animation: pulse 2.4s ease-in-out infinite; }
+  .status.offline { border-color: rgba(239, 68, 68, 0.4); }
+  .status.offline .dot { background: var(--danger); box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.16); }
+  .status-meta { color: var(--muted); font-weight: 500; font-size: 12px; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+  /* ---------- Layout ---------- */
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 24px; align-items: start; }
+  @media (max-width: 1080px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .card-head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 20px 24px; border-bottom: 1px solid var(--line);
+  }
+  .card-head .material-icons { color: var(--primary); font-size: 22px; }
+  .card-head h2 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: -0.01em; }
+  .card-head .hint { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 500; }
+  .card-body { padding: 22px 24px; }
+
+  /* ---------- Sliders ---------- */
+  .slider-row { margin-bottom: 19px; }
+  .slider-row:last-child { margin-bottom: 0; }
+  .slider-label { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 9px; }
+  .slider-label span { font-size: 13px; font-weight: 500; color: #CBD5E1; }
+  .slider-value {
+    font-size: 13px; font-weight: 700; color: var(--text);
+    background: var(--primary-soft); border: 1px solid rgba(124, 58, 237, 0.34);
+    padding: 3px 10px; border-radius: 8px; font-variant-numeric: tabular-nums;
+    min-width: 54px; text-align: center;
+  }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 6px; border-radius: 999px; outline: none; margin: 0;
+    background: rgba(148, 163, 184, 0.2);
+    cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    border: 2px solid #fff2; cursor: pointer;
+    box-shadow: 0 3px 10px -2px rgba(124, 58, 237, 0.85);
+    transition: transform 0.16s ease, box-shadow 0.16s ease;
+  }
+  input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.18); box-shadow: 0 4px 14px -2px rgba(236, 72, 153, 0.9); }
+  input[type=range]::-moz-range-thumb {
+    width: 16px; height: 16px; border-radius: 50%; border: 2px solid #fff2;
+    background: linear-gradient(135deg, var(--primary), var(--accent)); cursor: pointer;
+  }
+  .slider-note { margin: 7px 0 0; font-size: 11px; color: var(--muted); line-height: 1.5; }
+
+  /* ---------- Buttons ---------- */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 9px;
+    width: 100%; padding: 13px 20px; margin-top: 4px;
+    font-family: inherit; font-size: 14px; font-weight: 700; color: #fff;
+    background: linear-gradient(135deg, var(--primary), #6D28D9);
+    border: none; border-radius: 12px; cursor: pointer;
+    box-shadow: 0 8px 22px -10px rgba(124, 58, 237, 0.95);
+    transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+  }
+  .btn:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.09); box-shadow: 0 12px 26px -10px rgba(124, 58, 237, 1); }
+  .btn:active:not(:disabled) { transform: translateY(0); }
+  .btn:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
+  .btn .material-icons { font-size: 19px; }
+  .btn-ghost {
+    width: auto; padding: 7px 13px; font-size: 12px; font-weight: 600;
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--line); box-shadow: none; margin: 0;
+  }
+  .btn-ghost:hover:not(:disabled) { color: var(--text); border-color: var(--primary); filter: none; }
+
+  /* ---------- Spinner ---------- */
+  .spinner {
+    width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.28); border-top-color: #fff;
+    animation: spin 0.7s linear infinite;
+  }
+  .spinner.center { width: 26px; height: 26px; border-width: 3px; border-top-color: var(--primary); margin: 0 auto; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading-pane { padding: 40px 0; text-align: center; }
+  .loading-pane p { margin: 14px 0 0; font-size: 13px; color: var(--muted); }
+
+  /* ---------- Alerts ---------- */
+  .alert {
+    display: flex; gap: 11px; align-items: flex-start;
+    padding: 13px 15px; margin-top: 16px;
+    border-radius: 12px; font-size: 12.5px; line-height: 1.55;
+    background: rgba(239, 68, 68, 0.11);
+    border: 1px solid rgba(239, 68, 68, 0.34);
+    color: #FCA5A5;
+  }
+  .alert .material-icons { font-size: 18px; flex-shrink: 0; margin-top: 1px; }
+  .alert strong { color: #FECACA; display: block; margin-bottom: 3px; font-weight: 700; }
+  .alert code { background: rgba(0,0,0,0.32); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+
+  /* ---------- Result panel ---------- */
+  .result { margin-top: 22px; padding-top: 22px; border-top: 1px solid var(--line); animation: rise 0.42s cubic-bezier(0.22, 1, 0.36, 1); }
+  @keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+
+  .prob-block { text-align: center; padding: 8px 0 20px; }
+  .prob-value {
+    font-size: 68px; font-weight: 800; line-height: 1; letter-spacing: -0.045em;
+    font-variant-numeric: tabular-nums;
+    transition: color 0.6s cubic-bezier(0.22, 1, 0.36, 1), text-shadow 0.6s ease;
+  }
+  .prob-caption { margin-top: 9px; font-size: 12px; color: var(--muted); font-weight: 500; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 7px;
+    margin-top: 15px; padding: 8px 17px; border-radius: 999px;
+    font-size: 12px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase;
+    transition: background 0.4s ease, color 0.4s ease, border-color 0.4s ease;
+  }
+  .badge .material-icons { font-size: 16px; }
+  .badge.high { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.45); color: #FCA5A5; }
+  .badge.low { background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.45); color: #6EE7B7; }
+
+  .recommendation {
+    display: flex; gap: 11px; align-items: flex-start;
+    padding: 14px 16px; border-radius: 12px; margin-bottom: 22px;
+    background: rgba(15, 23, 42, 0.55); border: 1px solid var(--line);
+    font-size: 13px; line-height: 1.6; color: #CBD5E1;
+  }
+  .recommendation .material-icons { color: var(--accent); font-size: 19px; flex-shrink: 0; }
+
+  .chart-title { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 6px; }
+  .chart-sub { font-size: 11.5px; color: var(--muted); margin: 0 0 14px; line-height: 1.5; }
+  .chart-wrap { height: 172px; }
+  .legend { display: flex; gap: 18px; justify-content: center; margin-top: 14px; font-size: 11.5px; color: var(--muted); }
+  .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; margin-right: 6px; vertical-align: -1px; }
+
+  /* ---------- Batch ---------- */
+  textarea {
+    width: 100%; min-height: 132px; padding: 14px 15px;
+    background: rgba(15, 23, 42, 0.62); color: var(--text);
+    border: 1px solid var(--line); border-radius: 12px;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; line-height: 1.65;
+    resize: vertical; outline: none;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+  textarea::placeholder { color: #64748B; }
+
+  .format-hint {
+    display: flex; align-items: flex-start; gap: 10px;
+    margin: 0 0 13px; padding: 11px 13px;
+    background: rgba(124, 58, 237, 0.08); border: 1px solid rgba(124, 58, 237, 0.24);
+    border-radius: 10px; font-size: 11.5px; color: #C4B5FD; line-height: 1.65;
+  }
+  .format-hint .material-icons { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+  .format-hint code { display: block; margin-top: 5px; color: #DDD6FE; font-family: ui-monospace, Menlo, monospace; font-size: 11px; word-break: break-all; }
+  .batch-actions { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+  .batch-actions .btn { margin-top: 0; }
+
+  /* ---------- Summary ---------- */
+  .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 22px 0 18px; }
+  .stat {
+    padding: 15px 16px; border-radius: 12px; text-align: center;
+    background: rgba(15, 23, 42, 0.55); border: 1px solid var(--line);
+  }
+  .stat-value { font-size: 25px; font-weight: 800; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+  .stat-label { margin-top: 5px; font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+
+  /* ---------- Table ---------- */
+  .table-scroll { max-height: 430px; overflow: auto; border: 1px solid var(--line); border-radius: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead th {
+    position: sticky; top: 0; z-index: 1;
+    background: #172033; padding: 11px 14px; text-align: left;
+    font-size: 10.5px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.07em;
+    border-bottom: 1px solid var(--line);
+  }
+  tbody td { padding: 11px 14px; border-bottom: 1px solid rgba(148, 163, 184, 0.09); font-variant-numeric: tabular-nums; }
+  tbody tr { transition: background 0.15s ease; }
+  tbody tr:hover { background: rgba(124, 58, 237, 0.07); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr.is-selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  .cid { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: #CBD5E1; }
+  .prob-cell { font-weight: 700; }
+  .rank-cell { color: var(--muted); }
+  .mark-yes { color: var(--success); font-size: 19px; vertical-align: -4px; }
+  .mark-no { color: #475569; font-size: 19px; vertical-align: -4px; }
+
+  .empty { padding: 46px 20px; text-align: center; color: var(--muted); }
+  .empty .material-icons { font-size: 38px; opacity: 0.35; display: block; margin-bottom: 12px; }
+  .empty p { margin: 0; font-size: 13px; }
+
+  .footnote { margin-top: 26px; text-align: center; font-size: 11.5px; color: #64748B; line-height: 1.7; }
+  .footnote code { background: rgba(30, 41, 59, 0.8); padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// --- API wiring --------------------------------------------------------------
+
+const API_BASE = "http://127.0.0.1:8000";
+
+// Demo token: HS256 over secret "dev-secret-do-not-use-in-prod", exp 2099-01-01.
+// Valid only against a server started with that same dev secret. This is a
+// local-demo credential and must never be reused by a deployed service.
+const TOKEN =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkYXNoYm9hcmQtZGVtbyIsImlhdCI6MTc2NzIyNTYwMCwiZXhwIjo0MDcwOTA4ODAwfQ.E4taaD4gWXIebP4q3tMdlstC7JB2m3ZQMk4zlaBYV2U";
+
+// threshold.json. Displayed only -- the server returns threshold_used and
+// churn_predicted, and those decide the colour, never this constant.
+const THRESHOLD = 0.786;
+
+async function callApi(path, options = {}) {
+  let res;
+  try {
+    res = await fetch(API_BASE + path, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + TOKEN,
+        ...(options.headers || {}),
+      },
+    });
+  } catch (err) {
+    // fetch only rejects on transport failure: server down, DNS, or a CORS
+    // preflight the browser refused. The status codes below are all reachable.
+    throw new Error(
+      "Cannot reach the API at " + API_BASE +
+      ". Start the service with: CHURN_SERVICE_SECRET=\"dev-secret-do-not-use-in-prod\" python src/serve.py"
+    );
+  }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail || body.error || JSON.stringify(body);
+    } catch (_) { /* non-JSON error body; keep statusText */ }
+    if (res.status === 401) throw new Error("Auth rejected (401): " + detail + " — the server's CHURN_SERVICE_SECRET must be \"dev-secret-do-not-use-in-prod\" for this dashboard's token.");
+    if (res.status === 422) throw new Error("Validation failed (422): " + detail);
+    if (res.status === 429) throw new Error("Rate limited (429): " + detail);
+    throw new Error("HTTP " + res.status + ": " + detail);
+  }
+  return res.json();
+}
+
+// --- Feature contract --------------------------------------------------------
+
+// Order mirrors feature_spec.json. The API takes a named object so order does
+// not travel over the wire, but keeping it aligned makes the CSV columns and
+// the sliders read the same way.
+const FEATURES = [
+  { key: "recency_days",         label: "Days Since Last Session",  min: 0, max: 500, step: 1,   def: 90,
+    note: "Training uses a 999 sentinel for customers with no session before the cutoff; this slider covers the observed range." },
+  { key: "freq_30d",             label: "Sessions Last 30 Days",    min: 0, max: 10,  step: 1,   def: 1 },
+  { key: "freq_90d",             label: "Sessions Last 90 Days",    min: 0, max: 15,  step: 1,   def: 3 },
+  { key: "monetary_90d",         label: "Revenue Last 90 Days",     min: 0, max: 100, step: 1,   def: 5,  prefix: "$" },
+  { key: "purchase_count_90d",   label: "Purchases Last 90 Days",   min: 0, max: 5,   step: 1,   def: 0 },
+  { key: "avg_session_duration", label: "Avg Session Duration",     min: 0, max: 400, step: 5,   def: 150, suffix: "s" },
+  { key: "push_open_rate",       label: "Push Open Rate",           min: 0, max: 1,   step: 0.1, def: 0.2 },
+  { key: "campaign_click_rate",  label: "Campaign Click Rate",      min: 0, max: 1,   step: 0.1, def: 0.2 },
+  { key: "support_ticket_count", label: "Support Tickets",          min: 0, max: 5,   step: 1,   def: 0 },
+];
+
+const FEATURE_KEYS = FEATURES.map(f => f.key);
+const PRETTY = Object.fromEntries(FEATURES.map(f => [f.key, f.label]));
+const defaultFeatures = () => Object.fromEntries(FEATURES.map(f => [f.key, f.def]));
+
+const SAMPLE_CSV = [
+  "customer_id," + FEATURE_KEYS.join(","),
+  "cust_0001,240,0,1,0,0,60,0.0,0.0,2",
+  "cust_0002,12,6,14,85,3,260,0.7,0.5,0",
+  "cust_0003,90,1,3,5,0,150,0.2,0.2,0",
+  "cust_0004,999,0,0,0,0,0,0.0,0.0,1",
+  "cust_0005,30,3,8,42,2,210,0.5,0.4,0",
+  "cust_0006,175,1,2,3,0,95,0.1,0.1,3",
+].join("\n");
+
+const fmtPct = v => (v * 100).toFixed(1) + "%";
+
+// --- Header ------------------------------------------------------------------
+
+function Header() {
+  const [health, setHealth] = useState({ state: "checking" });
+
+  useEffect(() => {
+    let alive = true;
+    callApi("/health", { method: "GET" })
+      .then(d => { if (alive) setHealth({ state: d.status === "ok" ? "online" : "degraded", data: d }); })
+      .catch(e => { if (alive) setHealth({ state: "offline", error: e.message }); });
+    return () => { alive = false; };
+  }, []);
+
+  const text = {
+    checking: "Checking service…",
+    online: "Service Online",
+    degraded: "Service Degraded",
+    offline: "Service Offline",
+  }[health.state];
+
+  const cls = health.state === "online" ? "online"
+            : health.state === "checking" ? "" : "offline";
+
+  return (
+    <header className="header">
+      <div className="brand">
+        <div className="brand-mark"><span className="material-icons">insights</span></div>
+        <div>
+          <h1>Churn Prediction Service</h1>
+          <p className="subtitle">Localytics FDE Assignment</p>
+        </div>
+      </div>
+      <div className={"status " + cls} title={health.error || ""}>
+        <span className="dot"></span>
+        <span>{text}</span>
+        {health.data && (
+          <span className="status-meta">
+            · {health.data.model_version} · up {Math.round(health.data.uptime_seconds)}s
+          </span>
+        )}
+      </div>
+    </header>
+  );
+}
+
+// --- SHAP driver chart -------------------------------------------------------
+
+function ShapChart({ drivers }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    // Chart.js keeps a registry keyed by canvas; leaving the old instance alive
+    // makes the next render throw "Canvas is already in use".
+    if (chartRef.current) chartRef.current.destroy();
+
+    const up = d => d.direction.indexOf("increases") !== -1;
+
+    chartRef.current = new Chart(canvasRef.current.getContext("2d"), {
+      type: "bar",
+      data: {
+        labels: drivers.map(d => PRETTY[d.feature] || d.feature),
+        datasets: [{
+          data: drivers.map(d => d.magnitude),
+          backgroundColor: drivers.map(d => up(d) ? "#7C3AED" : "#EC4899"),
+          hoverBackgroundColor: drivers.map(d => up(d) ? "#8B5CF6" : "#F472B6"),
+          borderRadius: 6,
+          barThickness: 26,
+        }],
+      },
+      options: {
+        indexAxis: "y",
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 620, easing: "easeOutQuart" },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: "#0F172A",
+            borderColor: "rgba(148,163,184,0.25)",
+            borderWidth: 1,
+            padding: 11,
+            titleFont: { family: "Inter", size: 12 },
+            bodyFont: { family: "Inter", size: 12 },
+            callbacks: {
+              label: ctx => {
+                const d = drivers[ctx.dataIndex];
+                return "  " + d.magnitude.toFixed(3) + " log-odds · " + d.direction;
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            grid: { color: "rgba(148,163,184,0.10)" },
+            ticks: { color: "#94A3B8", font: { family: "Inter", size: 11 } },
+            title: { display: true, text: "|SHAP| contribution (log-odds)", color: "#64748B", font: { family: "Inter", size: 10 } },
+          },
+          y: {
+            grid: { display: false },
+            ticks: { color: "#CBD5E1", font: { family: "Inter", size: 11.5, weight: "500" } },
+          },
+        },
+      },
+    });
+
+    return () => { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
+  }, [drivers]);
+
+  return (
+    <div>
+      <div className="chart-title">Top 3 Risk Drivers</div>
+      <p className="chart-sub">
+        SHAP attribution for this prediction. Bar length is contribution magnitude in log-odds; colour is direction.
+      </p>
+      <div className="chart-wrap"><canvas ref={canvasRef}></canvas></div>
+      <div className="legend">
+        <span><i style={{ background: "#7C3AED" }}></i>Increases churn risk</span>
+        <span><i style={{ background: "#EC4899" }}></i>Decreases churn risk</span>
+      </div>
+    </div>
+  );
+}
+
+// --- Animated probability ----------------------------------------------------
+
+function AnimatedProbability({ value, high }) {
+  const [shown, setShown] = useState(0);
+
+  useEffect(() => {
+    let raf;
+    const from = 0, to = value, start = performance.now(), dur = 850;
+    const tick = now => {
+      const t = Math.min(1, (now - start) / dur);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setShown(from + (to - from) * eased);
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [value]);
+
+  const color = high ? "var(--danger)" : "var(--success)";
+  const glow = high ? "0 0 42px rgba(239,68,68,0.34)" : "0 0 42px rgba(16,185,129,0.30)";
+
+  return (
+    <div className="prob-block">
+      <div className="prob-value" style={{ color, textShadow: glow }}>{fmtPct(shown)}</div>
+      <div className="prob-caption">Churn probability · threshold {THRESHOLD.toFixed(3)}</div>
+      <div className={"badge " + (high ? "high" : "low")}>
+        <span className="material-icons">{high ? "priority_high" : "verified"}</span>
+        {high ? "High Risk" : "Low Risk"}
+      </div>
+    </div>
+  );
+}
+
+// --- Single customer scorer --------------------------------------------------
+
+function SingleScorer() {
+  const [features, setFeatures] = useState(defaultFeatures);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const set = useCallback((key, raw) => {
+    setFeatures(prev => ({ ...prev, [key]: parseFloat(raw) }));
+  }, []);
+
+  const score = async () => {
+    setLoading(true); setError(null);
+    try {
+      const data = await callApi("/score/single", {
+        method: "POST",
+        body: JSON.stringify({ customer_id: "dashboard-demo", features }),
+      });
+      setResult(data);
+    } catch (e) {
+      setError(e.message); setResult(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <section className="card">
+      <div className="card-head">
+        <span className="material-icons">person_search</span>
+        <h2>Single Customer Scorer</h2>
+        <span className="hint">9-feature RFM vector</span>
+      </div>
+      <div className="card-body">
+        {FEATURES.map(f => (
+          <div className="slider-row" key={f.key}>
+            <div className="slider-label">
+              <span>{f.label}</span>
+              <span className="slider-value">
+                {(f.prefix || "") + (f.step < 1 ? features[f.key].toFixed(1) : features[f.key]) + (f.suffix || "")}
+              </span>
+            </div>
+            <input
+              type="range"
+              min={f.min} max={f.max} step={f.step}
+              value={features[f.key]}
+              onChange={e => set(f.key, e.target.value)}
+            />
+            {f.note && <p className="slider-note">{f.note}</p>}
+          </div>
+        ))}
+
+        <button className="btn" onClick={score} disabled={loading} style={{ marginTop: 22 }}>
+          {loading ? <><span className="spinner"></span>Scoring…</> : <><span className="material-icons">bolt</span>Score Customer</>}
+        </button>
+
+        {error && (
+          <div className="alert">
+            <span className="material-icons">error_outline</span>
+            <div><strong>Scoring failed</strong>{error}</div>
+          </div>
+        )}
+
+        {loading && !result && (
+          <div className="loading-pane"><div className="spinner center"></div><p>Running model and SHAP explainer…</p></div>
+        )}
+
+        {result && !loading && (
+          <div className="result">
+            {/* churn_predicted comes from the server's own threshold comparison. */}
+            <AnimatedProbability value={result.churn_probability} high={result.churn_predicted} />
+            <div className="recommendation">
+              <span className="material-icons">tips_and_updates</span>
+              <div>{result.recommendation}</div>
+            </div>
+            {result.top_shap_drivers && result.top_shap_drivers.length > 0 && (
+              <ShapChart drivers={result.top_shap_drivers.slice(0, 3)} />
+            )}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// --- CSV parsing -------------------------------------------------------------
+
+// Deliberately strict: a mistyped header or a short row becomes a message here
+// rather than a 422 from the API with a less obvious cause.
+function parseCsv(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) throw new Error("Need a header row plus at least one data row.");
+
+  const header = lines[0].split(",").map(h => h.trim());
+  const expected = ["customer_id", ...FEATURE_KEYS];
+  const missing = expected.filter(c => header.indexOf(c) === -1);
+  if (missing.length) throw new Error("Missing column(s): " + missing.join(", "));
+
+  const idx = Object.fromEntries(expected.map(c => [c, header.indexOf(c)]));
+
+  return lines.slice(1).map((line, i) => {
+    const cells = line.split(",").map(c => c.trim());
+    if (cells.length < header.length) {
+      throw new Error("Row " + (i + 2) + " has " + cells.length + " cells, expected " + header.length + ".");
+    }
+    const customer_id = cells[idx.customer_id];
+    if (!customer_id) throw new Error("Row " + (i + 2) + " has an empty customer_id.");
+
+    const features = {};
+    for (const k of FEATURE_KEYS) {
+      const v = parseFloat(cells[idx[k]]);
+      if (!Number.isFinite(v)) {
+        throw new Error("Row " + (i + 2) + ", column " + k + ": \"" + cells[idx[k]] + "\" is not a number.");
+      }
+      features[k] = v;
+    }
+    return { customer_id, features };
+  });
+}
+
+// --- Batch scorer ------------------------------------------------------------
+
+function BatchScorer() {
+  const [csv, setCsv] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const run = async () => {
+    setLoading(true); setError(null);
+    let customers;
+    try {
+      customers = parseCsv(csv);
+    } catch (e) {
+      setError(e.message); setLoading(false); setResult(null); return;
+    }
+    if (customers.length > 1000) {
+      setError("Batch is " + customers.length + " rows; the API caps a request at 1000.");
+      setLoading(false); return;
+    }
+    try {
+      setResult(await callApi("/score/batch", { method: "POST", body: JSON.stringify({ customers }) }));
+    } catch (e) {
+      setError(e.message); setResult(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <section className="card">
+      <div className="card-head">
+        <span className="material-icons">groups</span>
+        <h2>Batch Scoring</h2>
+        <span className="hint">top-K selection at 30% budget</span>
+      </div>
+      <div className="card-body">
+        <div className="format-hint">
+          <span className="material-icons">description</span>
+          <div>
+            Paste CSV with a header row — <strong>customer_id</strong> plus the nine feature columns, in any column order. Max 1000 rows.
+            <code>customer_id,{FEATURE_KEYS.join(",")}</code>
+          </div>
+        </div>
+
+        <textarea
+          value={csv}
+          onChange={e => setCsv(e.target.value)}
+          spellCheck="false"
+          placeholder={"customer_id," + FEATURE_KEYS.join(",") + "\ncust_0001,240,0,1,0,0,60,0.0,0.0,2"}
+        />
+
+        <div className="batch-actions">
+          <button className="btn" onClick={run} disabled={loading || !csv.trim()} style={{ flex: 1 }}>
+            {loading ? <><span className="spinner"></span>Scoring batch…</> : <><span className="material-icons">playlist_add_check</span>Score Batch</>}
+          </button>
+          <button className="btn btn-ghost" onClick={() => { setCsv(SAMPLE_CSV); setError(null); }} disabled={loading}>
+            Load sample
+          </button>
+        </div>
+
+        {error && (
+          <div className="alert">
+            <span className="material-icons">error_outline</span>
+            <div><strong>Batch failed</strong>{error}</div>
+          </div>
+        )}
+
+        {loading && (
+          <div className="loading-pane"><div className="spinner center"></div><p>Scoring and ranking population…</p></div>
+        )}
+
+        {result && !loading && (
+          <>
+            <div className="summary">
+              <div className="stat">
+                <div className="stat-value">{result.total}</div>
+                <div className="stat-label">Total Scored</div>
+              </div>
+              <div className="stat">
+                <div className="stat-value" style={{ color: "var(--accent)" }}>{result.contacted_at_30pct}</div>
+                <div className="stat-label">Contacted at 30%</div>
+              </div>
+              <div className="stat">
+                <div className="stat-value" style={{ color: "var(--primary)" }}>{fmtPct(result.batch_selection_rate)}</div>
+                <div className="stat-label">Selection Rate</div>
+              </div>
+            </div>
+
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Customer ID</th>
+                    <th>Probability</th>
+                    <th>Rank</th>
+                    <th style={{ textAlign: "center" }}>Selected</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.scored.map(row => (
+                    <tr key={row.customer_id} className={row.selected ? "is-selected" : ""}>
+                      <td className="cid">{row.customer_id}</td>
+                      <td className="prob-cell" style={{ color: row.selected ? "var(--danger)" : "var(--success)" }}>
+                        {fmtPct(row.churn_probability)}
+                      </td>
+                      <td className="rank-cell">#{row.rank}</td>
+                      <td style={{ textAlign: "center" }}>
+                        <span className={"material-icons " + (row.selected ? "mark-yes" : "mark-no")}>
+                          {row.selected ? "check_circle" : "cancel"}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+
+        {!result && !loading && !error && (
+          <div className="empty">
+            <span className="material-icons">table_rows</span>
+            <p>Paste a CSV or load the sample, then score the batch.</p>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// --- App ---------------------------------------------------------------------
+
+function App() {
+  return (
+    <div className="shell">
+      <Header />
+      <div className="grid">
+        <SingleScorer />
+        <BatchScorer />
+      </div>
+      <p className="footnote">
+        Batch selection ranks by score and takes the top K = round(0.30 × N) rather than cutting at the
+        threshold — clustered scores make a probability cut overshoot the campaign budget.
+        <br />API <code>{API_BASE}</code> · rate limit 100 req/min per IP
+      </p>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

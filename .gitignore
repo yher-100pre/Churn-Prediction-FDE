@@ -27,3 +27,6 @@ __pycache__/
 aws/
 awscliv2.zip
 *.tar
+*.tfstate
+*.tfstate.backup
+infra/tfplan

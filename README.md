@@ -165,7 +165,7 @@ Criterion: **equal opportunity** (equal FNR across groups). A false negative is 
 
 8. In a second terminal, serve the dashboard:
    ```bash
-   cd ~/projects/Churn-Prediction-FDE/dashboard
+   cd dashboard
    python3 -m http.server 5500
    ```
 

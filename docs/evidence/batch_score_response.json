@@ -1,0 +1,1 @@
+{"scored":[{"customer_id":"batch_001","churn_probability":0.863931,"rank":1,"selected":true},{"customer_id":"batch_002","churn_probability":0.200961,"rank":2,"selected":false}],"total":2,"contacted_at_30pct":1,"batch_selection_rate":0.5}

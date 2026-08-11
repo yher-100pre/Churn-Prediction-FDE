@@ -1,0 +1,14 @@
+{
+    "imageIds": [
+        {
+            "imageDigest": "sha256:05e559cc1b46c8d6ddcc50ba133d294ee15379b677e15eeef73a3a28e4bd183a"
+        },
+        {
+            "imageDigest": "sha256:0594ca1592b00c65ed2abccf8fad427140437f72054b1f158842f898f3792145"
+        },
+        {
+            "imageDigest": "sha256:082adcb1e57618bb47caeea5a179b95a7d2ad2abb4f57664a62645c41b99fe84",
+            "imageTag": "latest"
+        }
+    ]
+}

@@ -11,7 +11,7 @@ FDE Assignment. Build production ready churn prediction service from raw mobile 
 - Temporal split: feature window BEFORE 2024-05-01, label window AFTER
 - Churn label: zero sessions in label window = churned
 - No temporal leakage: label derived only from post-cutoff data
-- Synthetic data: 1500 customers generated to preserve real sample statistical structure (event mix, timing, amounts)
+- Synthetic data: 8000 customers generated to preserve real sample statistical structure (event mix, timing, amounts)
 - Model XGBoost + SHAP explainability, with a Logistic Regression (or simple heuristic) baseline to beat. Evaluate with churn-appropriate metrics (class imbalance-aware; weigh false-negative vs false-positive cost — not raw accuracy). Fairness: check FNR across `plan_tier`, `acquisition_channel`, `region`. Model artifacts → `models/` (gitignored, destined for S3).
 
 Then: service code exposing scoring, `infra/` Terraform for AWS deployment, and `dashboard/` (React or Streamlit — TBD by time).

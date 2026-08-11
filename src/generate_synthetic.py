@@ -118,10 +118,10 @@ from feature_engineering import AS_OF, CUTOFF, build_features
 # --- Reproducibility ---------------------------------------------------------
 RANDOM_SEED = 42
 
-# 1500 customers: large enough that a 20% test split leaves ~300 rows, and that
+# 8000 customers: large enough that a 20% test split leaves ~1600 rows, and that
 # the smallest segment cell (premium x referral x latam) still holds enough
 # customers for a fairness slice to mean something.
-N_CUSTOMERS = 1500
+N_CUSTOMERS = 8000
 
 # --- Generation timeline -----------------------------------------------------
 # The raw sample spans 2022-07 to 2024-05, with a median per-customer active span

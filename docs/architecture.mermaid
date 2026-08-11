@@ -1,0 +1,55 @@
+%% Churn Prediction Service -- system architecture
+%% Rendered in README.md. Node line breaks use <br/> (Mermaid does not treat
+%% a literal \n in a label as a break; it prints the characters).
+
+flowchart LR
+
+  subgraph DATA ["Data & Training Pipeline"]
+    events[("data/events.json<br/>800 raw events, 80 customers")]
+    syn["generate_synthetic.py<br/>8000 customers, seeded"]
+    fe["feature_engineering.py<br/>RFM + temporal split"]
+    train["train.py<br/>XGBoost + SHAP + fairness"]
+    models[("models/<br/>artifacts")]
+
+    events --> syn
+    syn --> fe
+    fe --> train
+    train --> models
+  end
+
+  subgraph SERVE ["Prediction Service"]
+    serve["serve.py<br/>FastAPI + JWT + rate limit"]
+    health["GET /health"]
+    single["POST /score/single<br/>SHAP explanation"]
+    batch["POST /score/batch<br/>top-K ranking"]
+    dash["dashboard/index.html<br/>React + Chart.js"]
+
+    models --> serve
+    serve --> health
+    serve --> single
+    serve --> batch
+    serve --> dash
+  end
+
+  subgraph AWS ["AWS Infrastructure (Terraform)"]
+    s3[("S3: yen-churn-artifacts<br/>model artifacts")]
+    ecr["ECR: yen-churn-service<br/>Docker image"]
+    cw["CloudWatch<br/>logs + alarm"]
+    iam["IAM: yen-churn-pod-role<br/>least privilege S3"]
+  end
+
+  models -.->|"terraform upload"| s3
+  s3 -.->|"load on startup"| serve
+  serve -.->|"push logs"| cw
+  iam -.->|"grants s3:GetObject"| s3
+  ecr -.->|"image runs"| serve
+
+  classDef training fill:#7C3AED,color:#fff
+  classDef serving  fill:#1E293B,color:#F1F5F9,stroke:#7C3AED
+  classDef aws      fill:#0F172A,color:#F1F5F9,stroke:#EC4899
+  classDef datafile fill:#374151,color:#F1F5F9
+
+  class syn,fe,train training
+  class serve,health,single,batch,dash serving
+  class s3,ecr,cw,iam aws
+  class events,models datafile

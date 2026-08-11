@@ -210,7 +210,7 @@ def load_and_split(
         # reported metrics claim, and nothing downstream would reveal it.
         raise FileNotFoundError(
             f"Feature table not found: {features_path}\n"
-            f"Generate it first:  python src/generate_synthetic.py --n-customers 5000\n"
+            f"Generate it first:  python src/generate_synthetic.py --n-customers 8000\n"
             f"(training never regenerates its own input -- see load_and_split)"
         )
 

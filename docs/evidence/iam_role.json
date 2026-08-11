@@ -1,0 +1,43 @@
+{
+    "Role": {
+        "Path": "/",
+        "RoleName": "yen-churn-pod-role",
+        "RoleId": "AROATPN4GACEXGYEXPT3H",
+        "Arn": "arn:aws:iam::239302213769:role/yen-churn-pod-role",
+        "CreateDate": "2026-08-10T21:02:53+00:00",
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "EC2AssumeRole",
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Service": "ec2.amazonaws.com"
+                    },
+                    "Action": "sts:AssumeRole"
+                }
+            ]
+        },
+        "Description": "Read-only access to churn model artifacts for the prediction service.",
+        "MaxSessionDuration": 3600,
+        "Tags": [
+            {
+                "Key": "Environment",
+                "Value": "interview"
+            },
+            {
+                "Key": "ManagedBy",
+                "Value": "terraform"
+            },
+            {
+                "Key": "Project",
+                "Value": "churn-prediction"
+            },
+            {
+                "Key": "Candidate",
+                "Value": "yen-churn"
+            }
+        ],
+        "RoleLastUsed": {}
+    }
+}

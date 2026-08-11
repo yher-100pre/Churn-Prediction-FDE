@@ -1,0 +1,22 @@
+{
+  "cloudwatch_log_group": {
+    "sensitive": false,
+    "type": "string",
+    "value": "/yen-churn/prediction-service"
+  },
+  "ecr_repository_url": {
+    "sensitive": false,
+    "type": "string",
+    "value": "239302213769.dkr.ecr.us-east-1.amazonaws.com/yen-churn-service"
+  },
+  "iam_role_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:iam::239302213769:role/yen-churn-pod-role"
+  },
+  "s3_bucket_name": {
+    "sensitive": false,
+    "type": "string",
+    "value": "yen-churn-artifacts"
+  }
+}

@@ -1,0 +1,30 @@
+{
+    "MetricAlarms": [
+        {
+            "AlarmName": "yen-churn-service-errors",
+            "AlarmArn": "arn:aws:cloudwatch:us-east-1:239302213769:alarm:yen-churn-service-errors",
+            "AlarmDescription": "5 or more ERROR log lines from the churn prediction service within 5 minutes.",
+            "AlarmConfigurationUpdatedTimestamp": "2026-08-10T17:02:53.888000-04:00",
+            "ActionsEnabled": true,
+            "OKActions": [],
+            "AlarmActions": [],
+            "InsufficientDataActions": [],
+            "StateValue": "OK",
+            "StateReason": "Threshold Crossed: no datapoints were received for 1 period and 1 missing datapoint was treated as [NonBreaching].",
+            "StateReasonData": "{\"version\":\"1.0\",\"queryDate\":\"2026-08-10T21:04:03.764+0000\",\"statistic\":\"Sum\",\"period\":300,\"recentDatapoints\":[],\"threshold\":5.0,\"evaluatedDatapoints\":[{\"timestamp\":\"2026-08-10T20:59:00.000+0000\"}]}",
+            "StateUpdatedTimestamp": "2026-08-10T17:04:03.765000-04:00",
+            "MetricName": "ChurnServiceErrors",
+            "Namespace": "YenChurn",
+            "Statistic": "Sum",
+            "Dimensions": [],
+            "Period": 300,
+            "EvaluationPeriods": 1,
+            "Threshold": 5.0,
+            "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+            "TreatMissingData": "notBreaching",
+            "StateTransitionedTimestamp": "2026-08-10T17:04:03.765000-04:00"
+        }
+    ],
+    "CompositeAlarms": [],
+    "LogAlarms": []
+}
